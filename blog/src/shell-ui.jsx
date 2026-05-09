@@ -73,10 +73,6 @@ function IndexView({ lang, t, theme, navigate, S, formatDate }) {
         <div className="b-hero__eyebrow">{S.indexEyebrow}</div>
         <h1 className="b-hero__title">{S.indexTitle}</h1>
         <p className="b-hero__lede">{S.indexLede}</p>
-        <div className="b-hero__meta">
-          <span className="b-hero__count">{S.countLabel(all.length)}</span>
-          <span>{LANGS.length} {lang === 'zh' ? '语言' : 'languages'}</span>
-        </div>
       </section>
 
       <section className="b-list">
