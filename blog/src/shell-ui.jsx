@@ -4,23 +4,14 @@ import {
   getAllPosts, getAllTags, getPostBySlug, neighbors,
 } from './blog-components';
 import {
-  LANGS, THEMES, useHashRouter, useShellStrings, makeFormatDate, applyTheme,
+  LANGS, THEME_LIGHT, THEME_DARK,
+  useHashRouter, useShellStrings, makeFormatDate, applyTheme, getInitialTheme, isDark,
 } from './shell-core';
 
 /* ---------- topbar ---------- */
 
-function Topbar({ lang, theme, onLang, onTheme, onHome, S }) {
-  const [open, setOpen] = useState(false);
-  const ref = React.useRef(null);
-  useEffect(() => {
-    if (!open) return;
-    const onDoc = (e) => { if (ref.current && !ref.current.contains(e.target)) setOpen(false); };
-    const onKey = (e) => { if (e.key === 'Escape') setOpen(false); };
-    document.addEventListener('mousedown', onDoc);
-    document.addEventListener('keydown', onKey);
-    return () => { document.removeEventListener('mousedown', onDoc); document.removeEventListener('keydown', onKey); };
-  }, [open]);
-  const current = THEMES.find(t => t.id === theme) || THEMES[0];
+function Topbar({ lang, theme, onLang, onToggleTheme, onHome, S }) {
+  const dark = isDark(theme);
   return (
     <header className="b-topbar">
       <div className="b-topbar__inner">
@@ -35,48 +26,24 @@ function Topbar({ lang, theme, onLang, onTheme, onHome, S }) {
               <button key={l.code} className={lang === l.code ? 'is-active' : ''} onClick={() => onLang(l.code)}>{l.short}</button>
             ))}
           </div>
-          <div className="b-tm" ref={ref}>
-            <button
-              className="b-tm__trigger"
-              aria-label={S.themeLabel}
-              aria-haspopup="listbox"
-              aria-expanded={open}
-              title={pickLocale(current.label, lang)}
-              onClick={() => setOpen(o => !o)}>
-              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
-                <path d="M12 22a10 10 0 1 1 10-10c0 2.5-2 4-4 4h-2a2 2 0 0 0-1.5 3.3A2 2 0 0 1 12 22z"/>
-                <circle cx="7.5" cy="10.5" r="1.2" fill="currentColor" stroke="none"/>
-                <circle cx="12" cy="7" r="1.2" fill="currentColor" stroke="none"/>
-                <circle cx="16.5" cy="10.5" r="1.2" fill="currentColor" stroke="none"/>
+          <button
+            className="b-mode-toggle"
+            aria-label={dark ? 'Switch to light mode' : 'Switch to dark mode'}
+            onClick={onToggleTheme}>
+            {dark ? (
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                <circle cx="12" cy="12" r="5"/>
+                <line x1="12" y1="1" x2="12" y2="3"/><line x1="12" y1="21" x2="12" y2="23"/>
+                <line x1="4.22" y1="4.22" x2="5.64" y2="5.64"/><line x1="18.36" y1="18.36" x2="19.78" y2="19.78"/>
+                <line x1="1" y1="12" x2="3" y2="12"/><line x1="21" y1="12" x2="23" y2="12"/>
+                <line x1="4.22" y1="19.78" x2="5.64" y2="18.36"/><line x1="18.36" y1="5.64" x2="19.78" y2="4.22"/>
               </svg>
-              <span className="b-tm__label">{pickLocale(current.label, lang)}</span>
-              <svg className="b-tm__caret" width="10" height="10" viewBox="0 0 10 10" aria-hidden="true">
-                <path d="M2 3.5 L5 7 L8 3.5" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"/>
+            ) : (
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                <path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/>
               </svg>
-            </button>
-            {open && (
-              <div className="b-tm__menu" role="listbox" aria-label={S.themeLabel}>
-                {THEMES.map(t => (
-                  <button
-                    key={t.id}
-                    className={`b-tm__item b-tm__item--${t.id} ${theme === t.id ? 'is-active' : ''}`}
-                    role="option"
-                    aria-selected={theme === t.id}
-                    onClick={() => { onTheme(t.id); setOpen(false); }}>
-                    <span className="b-tm__txt">
-                      <span className="b-tm__name">{pickLocale(t.label, lang)}</span>
-                      <span className="b-tm__blurb">{pickLocale(t.blurb, lang)}</span>
-                    </span>
-                    {theme === t.id && (
-                      <svg width="12" height="12" viewBox="0 0 12 12" aria-hidden="true">
-                        <path d="M2.5 6.5 L5 9 L9.5 3" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"/>
-                      </svg>
-                    )}
-                  </button>
-                ))}
-              </div>
             )}
-          </div>
+          </button>
         </div>
       </div>
     </header>
@@ -109,7 +76,6 @@ function IndexView({ lang, t, theme, navigate, S, formatDate }) {
         <div className="b-hero__meta">
           <span className="b-hero__count">{S.countLabel(all.length)}</span>
           <span>{LANGS.length} {lang === 'zh' ? '语言' : 'languages'}</span>
-          <span>{THEMES.length} {lang === 'zh' ? '个主题' : 'themes'}</span>
         </div>
       </section>
 
@@ -304,8 +270,6 @@ function Footer({ lang, S }) {
       </div>
       <div className="b-footer__cols">
         <a className="b-a" href="#/">{S.backToIndex.replace('← ', '')}</a>
-        <span>{lang === 'zh' ? '订阅' : 'Subscribe'}</span>
-        <span>RSS</span>
       </div>
     </footer>
   );
@@ -316,20 +280,18 @@ function Footer({ lang, S }) {
 export default function App() {
   const router = useHashRouter();
   const initialLang = router.query.lang || localStorage.getItem('blog.lang') || 'en';
-  const initialTheme = router.query.theme || localStorage.getItem('blog.theme') || 'folio';
   const [lang, setLang] = useState(LANGS.some(l => l.code === initialLang) ? initialLang : 'en');
-  const [theme, setTheme] = useState(THEMES.some(t => t.id === initialTheme) ? initialTheme : 'folio');
+  const [theme, setTheme] = useState(getInitialTheme);
 
   useEffect(() => { applyTheme(theme); localStorage.setItem('blog.theme', theme); }, [theme]);
   useEffect(() => { document.documentElement.lang = lang; localStorage.setItem('blog.lang', lang); }, [lang]);
 
   useEffect(() => {
     if (router.query.lang && router.query.lang !== lang) setLang(router.query.lang);
-    if (router.query.theme && router.query.theme !== theme) setTheme(router.query.theme);
-  }, [router.query.lang, router.query.theme]);
+  }, [router.query.lang]);
 
   const onLang = (code) => { setLang(code); router.setQuery({ lang: code }); };
-  const onTheme = (id) => { setTheme(id); router.setQuery({ theme: id }); };
+  const onToggleTheme = () => setTheme(t => t === THEME_LIGHT ? THEME_DARK : THEME_LIGHT);
   const onHome = () => router.navigate('#/');
 
   useEffect(() => { window.scrollTo({ top: 0, behavior: 'instant' in window ? 'instant' : 'auto' }); }, [router.route.name, router.route.slug]);
@@ -340,7 +302,7 @@ export default function App() {
 
   return (
     <div className="b-shell">
-      <Topbar lang={lang} theme={theme} onLang={onLang} onTheme={onTheme} onHome={onHome} S={S} />
+      <Topbar lang={lang} theme={theme} onLang={onLang} onToggleTheme={onToggleTheme} onHome={onHome} S={S} />
       {router.route.name === 'index'
         ? <IndexView lang={lang} t={t} theme={theme} navigate={router.navigate} S={S} formatDate={formatDate} />
         : <PostView slug={router.route.slug} lang={lang} theme={theme} navigate={router.navigate} S={S} formatDate={formatDate} t={t} />}

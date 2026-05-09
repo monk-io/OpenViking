@@ -128,16 +128,26 @@ export function makeFormatDate(lang) {
   };
 }
 
-/* ---------- theme persistence ---------- */
+/* ---------- theme: light (纸) / dark (和纸) ---------- */
 
-export const THEMES = [
-  { id: 'folio',   label: { en: 'Folio',   zh: '文集' }, blurb: { en: 'Serif · warm',    zh: '衬线 · 暖色' } },
-  { id: 'console', label: { en: 'Console', zh: '终端' }, blurb: { en: 'Mono · dark',     zh: '等宽 · 暗色' } },
-  { id: 'garden',  label: { en: 'Garden',  zh: '园圃' }, blurb: { en: 'Serif · gentle',  zh: '衬线 · 柔和' } },
-  { id: 'kami',    label: { en: 'Kami',    zh: '纸' },   blurb: { en: 'Ink · parchment', zh: '墨蓝 · 纸色' } },
-];
+export const THEME_LIGHT = 'kami';
+export const THEME_DARK = 'washi';
+
+export function getSystemTheme() {
+  return window.matchMedia('(prefers-color-scheme: dark)').matches ? THEME_DARK : THEME_LIGHT;
+}
+
+export function getInitialTheme() {
+  const stored = localStorage.getItem('blog.theme');
+  if (stored === THEME_LIGHT || stored === THEME_DARK) return stored;
+  return getSystemTheme();
+}
 
 export function applyTheme(theme) {
   document.documentElement.setAttribute('data-theme', theme);
-  document.documentElement.style.colorScheme = theme === 'console' ? 'dark' : 'light';
+  document.documentElement.style.colorScheme = theme === THEME_DARK ? 'dark' : 'light';
+}
+
+export function isDark(theme) {
+  return theme === THEME_DARK;
 }
