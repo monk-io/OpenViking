@@ -1,0 +1,267 @@
+# OpenViking Context Database Architecture
+
+Source title: OpenViking Context Database Architecture
+Source URL: https://bytedance.larkoffice.com/wiki/OotPwGm2wiJdh8kNSKtc9owknme
+Published: 2026-05-12
+Author: maojia
+
+## Background
+
+Making data available to AI agents is still a hard infrastructure problem. The article starts from a practical observation attributed to Mike Stonebraker in April 2026: on a benchmark, large language models achieved 0% text-to-SQL accuracy; with RAG-style enhancements the result rose to around 10%; and when the prompt directly included the actual `FROM` clause, target tables, and join conditions, accuracy reached about 35%.
+
+The lesson is that models do not only need more text. They need data access, constraints, schemas, memory, and environment information in forms they can locate and use. OpenViking is positioned as a context database for AI agents. It uses database thinking as its core design paradigm, while choosing filesystem semantics as a NoSQL-style interface for agents.
+
+The previous OpenViking article introduced why context engineering can be treated as a database problem. This architecture article goes deeper: addressing, directory semantics, distributed deployment, consistency, multi-tenancy, role and permission boundaries, privacy, security, capacity, performance, and evaluation.
+
+## Technical Overview
+
+Repository: https://github.com/volcengine/OpenViking
+
+OpenViking uses multiple implementation languages:
+
+- Python 3 implements the core server logic. This choice is driven by the Python ecosystem around model calls, multimodal understanding, content parsing, and AI dependencies. `uv` is used for environment management.
+- Rust implements the CLI and RAGFS. The CLI benefits from fast startup and easier distribution. RAGFS benefits from stronger IO parallelism and throughput.
+- C++ is used for the embedded single-machine vector database so OpenViking can reuse and trim mature VikingDB code.
+- GitHub CI builds and publishes across Windows, Linux, and macOS on AArch64 and x64, including PyPI binaries and Docker images.
+
+OpenViking exposes HTTP APIs and can be accessed through CLI, SDK, Skills, and MCP. The documentation entry point is https://docs.openviking.ai.
+
+VikingBot is a secondary development of the nanobot project. It integrates OpenViking capabilities and serves as a reference external agent.
+
+## Directory Semantics And Addressing
+
+VikingDB began exploring directory-node filtering in early 2025 while working on vector-scalar filtering. The team observed that many unstructured information systems are organized as directory structures: code repositories, calendars, books, wikis, shelves, service trees, and similar hierarchies.
+
+VikingDB then designed directory-semantics algorithms, architecture, and interfaces. With the Viking DSL query language, a user can specify a directory as the retrieval scope. This gives O(1) scope selection over a directory tree rather than treating the path as ordinary scalar text.
+
+Example:
+
+```json
+{
+  "op": "must",
+  "field": "path",
+  "conds": ["/user/shengmaojia/memories"],
+  "para": "-d=1"
+}
+```
+
+The `path` field uses a `TYPE_PATH` index. The depth parameter controls scope:
+
+- `d=-1`: global retrieval under the current directory.
+- `d=0`: match the current node itself.
+- `d=x`: search downward from the directory by `x` levels.
+
+Directory semantics are not just syntax sugar. They must support real-time updates, depth specification, per-level caches, multiple roots, and fast tree-scoped retrieval. This differs significantly from normal scalar filtering. The article states that VikingDB is currently the only vector database with a directory index structure, which gives OpenViking a strong foundation for a context database.
+
+OpenViking then builds on this capability by exposing a filesystem-like context interface. To avoid confusing the database namespace with the local filesystem, OpenViking uses `viking://` URIs, for example:
+
+```text
+viking://resources/openviking/telemetry/
+```
+
+Design rules:
+
+- Context is progressively disclosed across L0, L1, and L2.
+- L0 is a short summary.
+- L1 describes the data structure.
+- L2 contains detailed information.
+- Every member in the database is treated as a file.
+- Every file is addressable by URI.
+- Every URI maps to an embedding vector.
+- OpenViking is not a filesystem. Uploaded files are parsed, processed, and transformed into AI-ready data.
+
+In VikingDB, each stored row contains a `path`-typed `uri` property. Other scalar fields remain available for common filtering needs.
+
+## Example: Adding An Image
+
+When an image is added with:
+
+```bash
+ov add-resource ./docs/images/grafana-demo-dashboard.png
+```
+
+OpenViking creates L0 and L1 summaries for agent readability and stores the image file as L2. L0, L1, and L2 are all processed by multimodal embedding models and written to the vector database.
+
+One image upload creates a directory containing only that image, for example:
+
+```text
+viking://resources/images/20260509/upload_321e98a827a0461f8721c683d726cbec_png
+```
+
+Files inside a code repository preserve their original relative paths. That lets agents use code-like navigation while OpenViking maintains semantic search underneath.
+
+## Distribution And Consistency
+
+The open-source version starts with a single-machine architecture by default. Production deployment needs larger capacity, higher throughput, and higher availability, so distribution and consistency are central recent work items.
+
+OpenViking supports multi-instance deployment. Unlike a normal database, it introduces a middleware layer to decouple storage. Through abstractions over the vector database interface, AGFS interface, logging, and telemetry, OpenViking can run without a local data disk. It depends on two core storage systems and builds context-data consistency above them.
+
+The open-source version intentionally avoids nonessential dependencies such as Redis and Kafka. It also manages account information, temporary working directories, transactions, task records, and work queues inside a unified filesystem abstraction.
+
+OpenViking deployment modes:
+
+- Full read-write mode: every deployment instance can receive both reads and writes. This is expected to become the mainstream mode. A remaining challenge is performance isolation, because a heavy write request can occupy CPU in a Python single-process server.
+- Read-write separation: instances are divided into write and read clusters. This provides load isolation and high availability for reads or writes, but it currently depends on manual separation and is not recommended as the default.
+
+Consistency requirements:
+
+- The vector database must provide consistency semantics. VikingDB provides eventual consistency, while the embedded single-machine vector database can provide strong consistency.
+- The distributed filesystem usually provides strong consistency, but ordering problems still need to be handled in OpenViking.
+- OpenViking uses file locks to protect conflicting writes. It has implemented simple directory locks and file locks, currently pessimistic, with basic rollback for failures and lock conflicts.
+
+The exact consistency model and the best-performing lock or transaction mechanism remain active research and community discussion topics.
+
+## Multi-Tenancy And Identity
+
+Local multi-tenant use is simple:
+
+```bash
+# configure root_api_key in server ov.conf before startup
+# configure the same root_api_key in client ovcli.conf
+ov admin register-user default <your_name>
+# configure the returned api_key in ovcli.conf
+```
+
+On public cloud, `root_api_key` is not exposed. Different capacity tiers expose different user-count limits.
+
+Multi-tenancy is mandatory for a data system. Conventional systems often identify users through group/user models such as Linux, or more complex organization/account structures such as cloud account systems. OpenViking has a harder identity question: how should agents be treated?
+
+### Role Model Version 1
+
+The first design used three layers: Account, User, and Agent. Permissions followed ownership: Agent belongs to User; User belongs to Account. An OpenViking instance can contain multiple Accounts for grouping, and users get RBAC roles such as Admin or normal user.
+
+This supports a familiar story: a company has teams, each team manages its own data, and each employee's agent can only access that employee's private data.
+
+Problem: how can one agent serve multiple visitors, while preserving memory from those conversations?
+
+### Role Model Version 2
+
+The second design still used Account, User, and Agent, but allowed Agent to own private data. Agent and User relationships could be inverted or combined instead of forcing Agent to belong to User.
+
+Problem: complexity increased sharply. Authentication still tied Agent to User, which made authorization relationships hard to reason about, weakened safety, and made the concepts of User and Agent hard to define. A personal assistant and a digital twin do not fit cleanly.
+
+### Role Model Version 3: Target Direction
+
+The target conclusion is that `user` is the only authentication object besides root. A user can represent either a human or an agent. OpenViking therefore removes Agent as a distinct identity concept and treats humans and agents uniformly as peers.
+
+The original motivation for separating agents was to let user memory be shared across applications, so any agent could access the user's global memory. This sounds attractive but fails in several cases:
+
+- A customer-service agent may need to manage memory about visitors who are not registered OpenViking users and do not have API keys.
+- In that scenario, the visitor is not a real authenticated User object.
+- The agent can store and isolate memory about its service targets internally.
+- The vector database can use a Peer concept to isolate retrieval.
+- The agent needs independent authentication and should not belong to a team employee.
+
+The conclusion is that agents should be treated as database users with independent authentication. This better respects user privacy.
+
+## Performance And Capacity
+
+OpenViking still has performance issues and should be evaluated carefully before production use. The team is actively optimizing.
+
+Observability:
+
+- `ov status` and `ov observer` provide operational visibility.
+- OpenViking exposes a `/metrics` endpoint for Prometheus, Grafana Agent, and similar monitoring systems.
+- The hosted service will provide detailed performance monitoring.
+
+Capacity is relatively straightforward once the distributed model exists. Performance depends on several layers.
+
+### Vector Database
+
+OpenViking supports tiered scaling through the vector database. For personal lightweight instances, creating one vector database per OpenViking instance would waste resources. The team therefore uses VikingDB DSL isolation filters to isolate different Account/User IDs as scalar constraints. One vector database can support millions of OpenViking instances, but each OpenViking instance is limited to around one million vectors. Heavy users, large-scale integrations, and large customer-service systems need a different mode where one OpenViking maps directly to one vector database for effectively unbounded index scale.
+
+### Filesystem
+
+Filesystem choices involve tradeoffs:
+
+- Local filesystem is fastest and easiest to deploy, but small and easy to lose.
+- ByteNAS inside TCE can provide reliability close to local filesystem performance for TB-scale data, but has throughput bottlenecks.
+- TOS/S3 is the most scalable and has effectively unlimited capacity, but is slower and can slow down the agent workflow.
+- EFS-like filesystems have larger capacity, enough performance, and reliable storage, and may become the main future option, but are currently available only on public cloud.
+
+### OpenViking Internal Chain
+
+Read requests such as RAG queries and memory retrieval can mainly be optimized through distributed multi-instance deployment. Write requests are harder because they involve:
+
+- File parsing and splitting.
+- VLM calls.
+- Embedding model calls.
+- Summarization.
+- Content segmentation.
+- Memory extraction.
+
+Consistency and lock performance, especially for writes and move operations, remain ongoing work.
+
+Optimization examples:
+
+- Queue and parallelize model calls so parsing and vectorization can run with controlled global concurrency, including concurrent large-model and embedding-model calls.
+- Replace the Go AGFS server with embedded calls and rewrite it in Rust to reduce internal data transfer overhead.
+- Parallelize file IO, for example by using tree structures to parallelize recursive `find` and `tree` operations.
+- Reduce data copying during upload and parsing. If files move from receiving directories to temporary work directories and then to visible directories, the underlying filesystem's move cost has a direct effect on end-to-end performance.
+
+## Privacy And Data Security
+
+For a context database, context is plaintext. Privacy and data security are mandatory.
+
+Permission safety:
+
+- OpenViking has three permission modes today but aims to compress them to two: `dev` and `api_key`.
+- The default is `dev` mode without authentication, but non-local deployments that listen beyond localhost must use `api_key`.
+- The root password is only for user management and not for data access, reducing the risk of leaked `root_api_key` during business development.
+- API keys carry identity information. The server validates and decodes them before any user-scoped data access.
+- Root identity is only used when running `ov --sudo`; ordinary requests do not carry the root secret.
+- Data under `viking://user` is visible only to the owning user, and VikingDB index filtering prevents searching other users' private data or leaking metadata.
+
+Storage safety:
+
+- File encryption is implemented.
+- Different tenants or Accounts can use different encryption keys.
+- Encryption still has performance tradeoffs, especially when remote storage must be decrypted before operations such as `grep`.
+
+Privacy configuration:
+
+- OpenViking has an experimental Skill privacy mechanism.
+- Secrets in public Skills are rewritten into protected storage.
+- When an agent reads a Skill, placeholders are restored automatically.
+- This reduces credential leakage from shared Skills in team collaboration.
+
+Example commands:
+
+```bash
+openviking privacy categories
+openviking privacy list skill
+openviking privacy get skill byted-viking-search-knowledgebase
+openviking privacy skill byted-viking-search-knowledgebase
+openviking privacy upsert skill byted-viking-search-knowledgebase \
+  --values-json '{"api_key":"secret-2","base_url":"https://example.com"}'
+openviking privacy upsert skill byted-viking-search-knowledgebase \
+  --key-api_key secret-3
+openviking privacy versions skill byted-viking-search-knowledgebase
+openviking privacy version skill byted-viking-search-knowledgebase 2
+openviking privacy activate skill byted-viking-search-knowledgebase 2
+```
+
+## Evaluation And Agent Support
+
+Evaluation is benchmark-driven and deserves a separate article. The key evaluation scenarios include:
+
+- RAG benchmarks.
+- Memory benchmarks.
+- Long-task benchmarks.
+- SWE benchmarks.
+- Multi-agent human-agent collaboration.
+
+Key evaluation dimensions include:
+
+- Accuracy.
+- Task latency.
+- Token usage.
+- Multimodal support.
+
+Agent support with OpenViking Serverless is work in progress.
+
+## Closing
+
+OpenViking is moving from conceptual architecture to product construction. Through open source, the team has collected many issues and large amounts of feedback. Capacity and performance are now core priorities.
+
+The original document closes by thanking more than 150 developers and participants who contributed code, ideas, data, and use cases, with more than 1000 merges and more than 23k stars, toward building what it calls the "MongoDB of the AI era."

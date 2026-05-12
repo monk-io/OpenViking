@@ -4,14 +4,18 @@ You are an agent adding a post to the **OpenViking Blog**. This document is the 
 
 ---
 
-## Practical notes from the OpenViking context post
+## Practical notes from OpenViking blog case studies
+
+For the full review trail and tradeoffs, read the case studies:
+[`docs/case-studies/openviking-context-post.md`](docs/case-studies/openviking-context-post.md) and
+[`docs/case-studies/openviking-context-architecture-post.md`](docs/case-studies/openviking-context-architecture-post.md).
 
 1. Build for two readers: the HTML page is for humans, while `/post/<slug>/llm.txt` is for agents. Keep `llm.txt` clean, source-like, and English-only when requested; expose it through page metadata and `/llms.txt`, not through visible helper copy.
 2. Let the article structure drive the TOC. Use `H2` for major sections, `H3` for TOC-level blocks, and `H4` inside cards/panels. Do not add TOC index numbers. Folding is opt-in via `TOC foldable`; default should stay expanded.
-3. Prefer visible, scrollable presentation over hidden click-to-reveal panels. Tabs and chips should act as sticky jump/navigation aids, not as the only way to discover content.
-4. Treat covers as editorial signals, not diagrams. Use abstract 16:9 art for the core insight, keep high-res imagery for post hero/OG, and provide a lighter `cardCover` for index cards when the source image is large.
+3. Prefer visible, scrollable presentation over hidden click-to-reveal panels. Tabs and chips should focus attention, not duplicate a working TOC or become the only way to discover content.
+4. Treat covers as editorial signals, not diagrams. For OpenViking architecture posts, prefer airy watercolor on cream paper with generous negative space, subtle OV logo hints, warm gold/sage/graphite palettes, and no literal keys, locks, oversized logos, dense diagrams, or blue/purple-dominant branding. Keep high-res imagery for post hero/OG, and provide a lighter `cardCover` for index cards when the source image is large.
 5. Respect the post language end to end. Switching language must update body, shell-adjacent UI such as TOC, dates, and labels without requiring refresh.
-6. For Lark-derived posts, preserve source provenance in metadata, but remove internal rendering notes from the human article. The page should read like a finished blog post, not a build log.
+6. For Lark-derived posts, preserve source provenance in metadata, but remove internal rendering notes from the human article. Validate custom component states in generated HTML; small CSS details like inline progress fills can break visible UI.
 
 ---
 
@@ -92,9 +96,11 @@ import myEssay from './my-essay/index.jsx';
 
 Write bilingual content in this order:
 
-1. **Write the English version first.** Get the structure, examples, and technical content right.
-2. **Translate to Chinese.** Produce a faithful translation.
-3. **Optimize the Chinese version for natural tone.** Follow the [shuorenhua](https://github.com/MrGeDiao/shuorenhua) guidelines: no AI filler, no template openers/closers ("In this article we will explore..."), no empty adjectives. Write like you're explaining to a colleague, not writing a press release.
+1. **Scaffold the post first.** Map the source into the thesis, H2 sections, key examples, metadata, cover, and `llm.txt` path before polishing individual paragraphs.
+2. **Write the English version first.** Get the structure, examples, and technical content right. For long architecture posts, make the first pass a coherent frame, not the final density target.
+3. **Run a second filling pass.** Use parallel agents when allowed: one for source/content gaps, one for frontend rendering blocks, and one for terminology/translation QA. Integrate their work into one coherent article instead of pasting isolated panels.
+4. **Translate to Chinese after the structure stabilizes.** Produce a faithful translation, including custom component labels, sticky nav, tables, captions, and interactive states.
+5. **Optimize the Chinese version for natural tone.** Follow the [shuorenhua](https://github.com/MrGeDiao/shuorenhua) guidelines: no AI filler, no template openers/closers ("In this article we will explore..."), no empty adjectives. Write like you're explaining to a colleague, not writing a press release.
 
 ---
 
