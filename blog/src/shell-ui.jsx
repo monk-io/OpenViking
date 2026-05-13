@@ -17,7 +17,14 @@ function Topbar({ lang, theme, onLang, onToggleTheme, onHome, S }) {
     <header className="b-topbar">
       <div className="b-topbar__inner">
         <a className="b-brand" href="/" onClick={(e) => { e.preventDefault(); onHome(); }}>
-          <img className="b-brand__mark" src="/assets/logo.png" alt="OpenViking" />
+          <img
+            className="b-brand__mark"
+            src="/assets/logo.png"
+            alt="OpenViking"
+            loading="eager"
+            decoding="async"
+            fetchpriority="high"
+          />
           <span className="b-brand__name">{S.siteName}</span>
           <span className="b-brand__sub">// {S.siteSub}</span>
         </a>
@@ -130,7 +137,11 @@ function PostCard({ post, lang, navigate, S, formatDate, featured }) {
   };
   return (
     <a className={`b-card ${featured ? 'b-card--featured' : ''}`} href={href} onClick={open}>
-      {cover ? <div className="b-card__cover"><img src={cover} alt="" /></div> : null}
+      {cover ? (
+        <div className="b-card__cover">
+          <img src={cover} alt="" loading="lazy" decoding="async" />
+        </div>
+      ) : null}
       <div className="b-card__body">
         <div className="b-card__meta">
           <span>{formatDate(m.publishedAt)}</span>
@@ -142,7 +153,9 @@ function PostCard({ post, lang, navigate, S, formatDate, featured }) {
         <div className="b-card__foot">
           {author ? (
             <div className="b-card__author">
-              {author.avatar ? <img src={author.avatar} className="b-card__avatar" alt="" /> : null}
+              {author.avatar ? (
+                <img src={author.avatar} className="b-card__avatar" alt="" loading="lazy" decoding="async" />
+              ) : null}
               <span>{author.name}</span>
             </div>
           ) : <span/>}
@@ -186,7 +199,11 @@ export function PostView({ slug, lang, theme, navigate, S, formatDate, t }) {
       <ReadingProgress />
 
       <div className="b-post__hero">
-        {m.cover ? <div className="b-post__cover"><img src={m.cover} alt="" /></div> : null}
+        {m.cover ? (
+          <div className="b-post__cover">
+            <img src={m.cover} alt="" loading="eager" decoding="async" fetchpriority="high" />
+          </div>
+        ) : null}
       </div>
 
       <header className="b-post__head">
@@ -200,7 +217,9 @@ export function PostView({ slug, lang, theme, navigate, S, formatDate, t }) {
           <div style={{ display: 'flex', gap: 16, flexWrap: 'wrap' }}>
             {(m.authors || []).map(a => (
               <div key={a.name} className="b-author">
-                {a.avatar ? <img src={a.avatar} className="b-author__avatar" alt="" /> : null}
+                {a.avatar ? (
+                  <img src={a.avatar} className="b-author__avatar" alt="" loading="lazy" decoding="async" />
+                ) : null}
                 <div>
                   <div className="b-author__name">
                     {a.github ? <a href={`https://github.com/${a.github}`} target="_blank" rel="noreferrer">{a.name}<ExternalArrowIcon /></a> : a.name}

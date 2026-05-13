@@ -242,7 +242,14 @@ export function Figure({ src, alt, caption, credit, frame = 'plain', size = 'md'
   return (
     <figure className={`b-figure b-figure--${size} b-figure--${frame}`}>
       <div className="b-figure__media">
-        {src ? <img src={src} alt={alt || (caption ? flattenChildren(caption) : '')} /> : <div className="b-figure__ph">image</div>}
+        {src ? (
+          <img
+            src={src}
+            alt={alt || (caption ? flattenChildren(caption) : '')}
+            loading="lazy"
+            decoding="async"
+          />
+        ) : <div className="b-figure__ph">image</div>}
       </div>
       {caption || credit ? (
         <figcaption className="b-figure__cap">
