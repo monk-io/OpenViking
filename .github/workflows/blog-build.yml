@@ -102,6 +102,10 @@ jobs:
             --recursive \
             --exclude "assets/*.css" \
             --exclude "assets/*.js" \
+            --exclude "assets/*.woff" \
+            --exclude "assets/*.woff2" \
+            --exclude "assets/*.ttf" \
+            --exclude "assets/*.otf" \
             --cache-control "${HTML_CACHE_CONTROL}" \
             --only-show-errors
 
@@ -111,6 +115,10 @@ jobs:
             --exclude "*" \
             --include "assets/*.css" \
             --include "assets/*.js" \
+            --include "assets/*.woff" \
+            --include "assets/*.woff2" \
+            --include "assets/*.ttf" \
+            --include "assets/*.otf" \
             --cache-control "${STATIC_CACHE_CONTROL}" \
             --only-show-errors
 
