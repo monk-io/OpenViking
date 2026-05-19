@@ -24,6 +24,16 @@ from vikingbot.bus.queue import MessageBus
 from vikingbot.channels.feishu import FeishuChannel
 from vikingbot.config.schema import Config, FeishuChannelConfig, SessionKey
 
+try:
+    from lark_oapi.api.im.v1.model.p2_im_message_reaction_created_v1 import (
+        P2ImMessageReactionCreatedV1,
+    )
+
+    FEISHU_SDK_MODELS_AVAILABLE = True
+except ImportError:
+    P2ImMessageReactionCreatedV1 = None
+    FEISHU_SDK_MODELS_AVAILABLE = False
+
 
 class _FakeLangfuseClient:
     def __init__(self):
@@ -369,4 +379,111 @@ async def test_feishu_reaction_event_ignores_non_user_or_unknown_reactions(tmp_p
         await channel._on_message_reaction_created(payload)
 
     assert bus.outbound_size == 0
+    assert fake_langfuse.outcome_calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(not FEISHU_SDK_MODELS_AVAILABLE, reason="Feishu SDK models unavailable")
+async def test_feishu_reaction_event_accepts_real_sdk_payload_without_chat_context(
+    tmp_path: Path, monkeypatch
+):
+    channel, bus = _build_channel(tmp_path, monkeypatch)
+    fake_langfuse = _FakeLangfuseClient()
+    monkeypatch.setattr(
+        "vikingbot.channels.feishu.LangfuseClient.get_instance",
+        staticmethod(lambda: fake_langfuse),
+    )
+
+    session_key = SessionKey(type="feishu", channel_id="app-123", chat_id="oc_chat#om_root")
+    session = channel._session_manager.get_or_create(session_key, skip_heartbeat=True)
+    session.add_message(
+        "assistant",
+        "hello",
+        response_id="resp-real-sdk",
+        timestamp="2026-04-30T00:00:00",
+        platform_message_id="om_msg_real",
+    )
+    session.metadata[channel.REACTION_MESSAGE_MAP_KEY] = {"om_msg_real": "resp-real-sdk"}
+    await channel._session_manager.save(session)
+
+    payload = P2ImMessageReactionCreatedV1(
+        {
+            "event": {
+                "message_id": "om_msg_real",
+                "reaction_type": {"emoji_type": "THUMBSUP"},
+                "operator_type": "user",
+                "user_id": {"open_id": "ou_user_real"},
+                "app_id": "cli_a",
+                "action_time": "1714435200",
+            }
+        }
+    )
+
+    await channel._on_message_reaction_created(payload)
+
+    assert bus.outbound_size == 2
+    outcome_event = await bus.consume_outbound()
+    feedback_event = await bus.consume_outbound()
+    assert outcome_event.response_id == "resp-real-sdk"
+    assert outcome_event.metadata["response_outcome_evaluated"]["outcome_label"] == "positive_feedback"
+    assert feedback_event.metadata["feedback_submitted"]["feedback_type"] == "thumb_up"
+    assert feedback_event.metadata["feedback_submitted"]["user_id"] == "ou_user_real"
+
+    persisted = channel._session_manager.get_or_create(session_key, skip_heartbeat=True)
+    assert persisted.metadata["feedback_events"][0]["user_id"] == "ou_user_real"
+    assert fake_langfuse.outcome_calls[0][0] == "resp-real-sdk"
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(not FEISHU_SDK_MODELS_AVAILABLE, reason="Feishu SDK models unavailable")
+async def test_feishu_reaction_event_real_sdk_payload_dedupes_by_open_id(tmp_path: Path, monkeypatch):
+    channel, bus = _build_channel(tmp_path, monkeypatch)
+    fake_langfuse = _FakeLangfuseClient()
+    monkeypatch.setattr(
+        "vikingbot.channels.feishu.LangfuseClient.get_instance",
+        staticmethod(lambda: fake_langfuse),
+    )
+
+    session_key = SessionKey(type="feishu", channel_id="app-123", chat_id="oc_chat")
+    session = channel._session_manager.get_or_create(session_key, skip_heartbeat=True)
+    session.add_message(
+        "assistant",
+        "hello",
+        response_id="resp-real-dedupe",
+        timestamp="2026-04-30T00:00:00",
+        platform_message_id="om_msg_real_dedupe",
+    )
+    session.metadata[channel.REACTION_MESSAGE_MAP_KEY] = {"om_msg_real_dedupe": "resp-real-dedupe"}
+    session.metadata["feedback_events"] = [
+        {
+            "response_id": "resp-real-dedupe",
+            "session_id": session_key.safe_name(),
+            "user_id": "ou_user_real",
+            "feedback_type": "thumb_up",
+            "feedback_score": 1.0,
+            "feedback_reason": "feishu_reaction",
+            "feedback_text": "THUMBSUP",
+            "feedback_delay_sec": 1.0,
+            "channel": session_key.channel_key(),
+            "created_at": "2026-04-30T00:01:00",
+        }
+    ]
+    await channel._session_manager.save(session)
+
+    payload = P2ImMessageReactionCreatedV1(
+        {
+            "event": {
+                "message_id": "om_msg_real_dedupe",
+                "reaction_type": {"emoji_type": "THUMBSUP"},
+                "operator_type": "user",
+                "user_id": {"open_id": "ou_user_real"},
+            }
+        }
+    )
+
+    await channel._on_message_reaction_created(payload)
+
+    assert bus.outbound_size == 0
+    persisted = channel._session_manager.get_or_create(session_key, skip_heartbeat=True)
+    assert len(persisted.metadata["feedback_events"]) == 1
     assert fake_langfuse.outcome_calls == []

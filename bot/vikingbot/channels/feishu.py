@@ -749,16 +749,28 @@ class FeishuChannel(BaseChannel):
                 event,
                 ("operator", "operator_id"),
                 ("operator_id",),
+                ("user_id", "open_id"),
+                ("user_id", "user_id"),
+                ("user_id", "union_id"),
                 ("user_id",),
             )
 
             if operator_type and operator_type != "user":
                 return
-            if not all(isinstance(value, str) and value for value in (message_id, emoji_type, chat_id, chat_type, user_id)):
+            if not all(isinstance(value, str) and value for value in (message_id, emoji_type, user_id)):
                 return
 
             feedback_type = self._reaction_feedback_type(emoji_type)
             if feedback_type is None:
+                return
+
+            if not isinstance(chat_id, str) or not chat_id or not isinstance(chat_type, str) or not chat_type:
+                await self._submit_reaction_feedback_by_message_id(
+                    platform_message_id=message_id,
+                    user_id=user_id,
+                    emoji_type=emoji_type,
+                    feedback_type=feedback_type,
+                )
                 return
 
             await self._submit_reaction_feedback(
@@ -849,33 +861,79 @@ class FeishuChannel(BaseChannel):
             if feedback_update is None:
                 return
 
-            response_id, feedback_event, outcome_payload = feedback_update
-            if outcome_payload is not None:
-                LangfuseClient.get_instance().update_response_outcome(
-                    response_id,
-                    outcome_payload["outcome_label"],
-                    outcome_payload,
-                )
-                await self.bus.publish_outbound(
-                    OutboundMessage(
-                        session_key=session.key,
-                        content="",
-                        event_type=OutboundEventType.RESPONSE_OUTCOME_EVALUATED,
-                        response_id=response_id,
-                        metadata={"response_outcome_evaluated": outcome_payload},
-                    )
-                )
+            await self._publish_reaction_feedback_update(session, feedback_update)
+            return
 
+    async def _submit_reaction_feedback_by_message_id(
+        self,
+        *,
+        platform_message_id: str,
+        user_id: str,
+        emoji_type: str,
+        feedback_type: str,
+    ) -> None:
+        for session_info in self._session_manager.list_sessions():
+            session_key = session_info.get("key")
+            if not isinstance(session_key, SessionKey):
+                continue
+            if session_key.type != str(getattr(self.channel_type, "value", self.channel_type)):
+                continue
+            if session_key.channel_id != self.channel_id:
+                continue
+
+            try:
+                session, feedback_update = await self._session_manager.update_session(
+                    session_key,
+                    lambda session: self._apply_reaction_feedback(
+                        session,
+                        session_key=session_key,
+                        platform_message_id=platform_message_id,
+                        user_id=user_id,
+                        emoji_type=emoji_type,
+                        feedback_type=feedback_type,
+                    ),
+                    skip_heartbeat=True,
+                )
+            except LookupError:
+                continue
+
+            if feedback_update is None:
+                return
+
+            await self._publish_reaction_feedback_update(session, feedback_update)
+            return
+
+    async def _publish_reaction_feedback_update(
+        self,
+        session: Session,
+        feedback_update: tuple[str, dict[str, Any], dict[str, Any] | None],
+    ) -> None:
+        response_id, feedback_event, outcome_payload = feedback_update
+        if outcome_payload is not None:
+            LangfuseClient.get_instance().update_response_outcome(
+                response_id,
+                outcome_payload["outcome_label"],
+                outcome_payload,
+            )
             await self.bus.publish_outbound(
                 OutboundMessage(
                     session_key=session.key,
                     content="",
-                    event_type=OutboundEventType.FEEDBACK_SUBMITTED,
+                    event_type=OutboundEventType.RESPONSE_OUTCOME_EVALUATED,
                     response_id=response_id,
-                    metadata={"feedback_submitted": feedback_event},
+                    metadata={"response_outcome_evaluated": outcome_payload},
                 )
             )
-            return
+
+        await self.bus.publish_outbound(
+            OutboundMessage(
+                session_key=session.key,
+                content="",
+                event_type=OutboundEventType.FEEDBACK_SUBMITTED,
+                response_id=response_id,
+                metadata={"feedback_submitted": feedback_event},
+            )
+        )
 
     def _apply_reaction_feedback(
         self,
