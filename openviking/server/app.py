@@ -23,7 +23,7 @@ from openviking.server.config import (
     load_server_config,
     validate_server_config,
 )
-from openviking.server.dependencies import set_service
+from openviking.server.dependencies import set_server_config, set_service
 from openviking.server.error_mapping import map_exception
 from openviking.server.identity import AuthMode, Role
 from openviking.server.models import ERROR_CODE_TO_HTTP_STATUS, ErrorInfo, Response
@@ -45,6 +45,7 @@ from openviking.server.routers import (
     stats_router,
     system_router,
     tasks_router,
+    watches_router,
     webdav_router,
 )
 from openviking.service.core import OpenVikingService
@@ -310,6 +311,7 @@ def create_app(
     )
 
     app.state.config = config
+    set_server_config(config)
 
     # Add CORS middleware
     app.add_middleware(
@@ -511,6 +513,7 @@ def create_app(
     app.include_router(observer_router)
     app.include_router(metrics_router)
     app.include_router(tasks_router)
+    app.include_router(watches_router)
     app.include_router(webdav_router)
     app.include_router(bot_router, prefix="/bot/v1")
 
@@ -594,12 +597,18 @@ def create_app(
         logger.warning("Skipping OAuth router registration: %s", e)
 
     # Favicon: shared with the console static assets so 1933/console use the same logo.
+    # Some MCP clients (claude.ai connector cards) resolve the icon relative to the
+    # connector URL (e.g. {mcp_url}/favicon.ico) rather than the origin, so the same
+    # files are also exposed under /mcp/.
     _static_dir = Path(__file__).resolve().parent.parent / "console" / "static"
     _favicon_headers = {"Cache-Control": "public, max-age=86400"}
     _favicon_files = {
         "/favicon.ico": ("favicon.ico", "image/x-icon"),
         "/favicon.png": ("favicon-32.png", "image/png"),
         "/apple-touch-icon.png": ("apple-touch-icon.png", "image/png"),
+        "/mcp/favicon.ico": ("favicon.ico", "image/x-icon"),
+        "/mcp/favicon.png": ("favicon-32.png", "image/png"),
+        "/mcp/apple-touch-icon.png": ("apple-touch-icon.png", "image/png"),
     }
 
     def _make_favicon_handler(filename: str, media_type: str):
