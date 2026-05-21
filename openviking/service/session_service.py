@@ -12,6 +12,7 @@ from typing import Any, Dict, List, Optional
 from uuid import uuid4
 
 from openviking.core.namespace import canonical_session_uri
+from openviking.server.config import ToolOutputExternalizationConfig
 from openviking.server.identity import RequestContext, Role
 from openviking.service.task_tracker import get_task_tracker
 from openviking.session import Session
@@ -53,6 +54,7 @@ class SessionService:
         self._archive_task_store: Optional[ArchiveFinalizeTaskStore] = None
         self._archive_worker_task: Optional[asyncio.Task] = None
         self._archive_worker_stop: Optional[asyncio.Event] = None
+        self._tool_output_externalization_config = ToolOutputExternalizationConfig()
 
     def set_dependencies(
         self,
@@ -159,6 +161,12 @@ class SessionService:
                     error,
                 )
 
+    def set_tool_output_externalization_config(
+        self, config: ToolOutputExternalizationConfig
+    ) -> None:
+        """Set tool output externalization controls for newly created sessions."""
+        self._tool_output_externalization_config = config.model_copy(deep=True)
+
     def _ensure_initialized(self) -> None:
         """Ensure all dependencies are initialized."""
         if not self._viking_fs:
@@ -210,6 +218,7 @@ class SessionService:
             user=ctx.user,
             ctx=ctx,
             session_id=session_id,
+            tool_output_externalization_config=self._tool_output_externalization_config,
         )
 
     async def create(self, ctx: RequestContext, session_id: Optional[str] = None) -> Session:
