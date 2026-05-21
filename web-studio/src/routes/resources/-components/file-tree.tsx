@@ -31,7 +31,7 @@ interface TreeNodeProps {
 
 const FolderIcon = ({ isOpen }: { isOpen: boolean }) => (
   <svg
-    className="size-5 shrink-0 text-foreground/70"
+    className="size-4 shrink-0 text-foreground/70"
     viewBox="0 0 24 24"
     fill="currentColor"
     stroke="none"
@@ -87,7 +87,8 @@ function TreeNode({
 }: TreeNodeProps) {
   const { t } = useTranslation('resources')
   const isOpen = expandedKeys.has(entry.uri)
-  const isDirSelected = entry.isDir && currentUri === entry.uri
+  const isDirSelected =
+    entry.isDir && currentUri === entry.uri && !selectedFileUri
   const isFileSelected = !entry.isDir && selectedFileUri === entry.uri
 
   const entryRef = useRef(entry)
@@ -127,14 +128,14 @@ function TreeNode({
         )}
         <div
           className={cn(
-            'flex cursor-pointer items-center gap-2 rounded-md px-2 py-1.5 transition-colors',
+            'flex cursor-pointer items-center gap-2 rounded-md px-2 py-1 transition-colors md:py-1.5',
             isFileSelected ? 'bg-muted text-foreground' : 'hover:bg-muted/50',
           )}
           onClick={handleSelect}
         >
           <span aria-hidden className="inline-flex size-4 shrink-0" />
           <File className="size-4 shrink-0 text-muted-foreground" />
-          <span className="min-w-0 truncate text-sm">{entry.name}</span>
+          <span className="min-w-0 truncate text-xs md:text-sm">{entry.name}</span>
         </div>
       </div>
     )
@@ -148,7 +149,7 @@ function TreeNode({
         )}
         <div
           className={cn(
-            'flex cursor-pointer items-center gap-2 rounded-md px-2 py-1.5 transition-colors',
+            'flex cursor-pointer items-center gap-2 rounded-md px-2 py-1 transition-colors md:py-1.5',
             isDirSelected ? 'bg-muted text-foreground' : 'hover:bg-muted/50',
           )}
           onClick={handleSelect}
@@ -172,7 +173,7 @@ function TreeNode({
             <span aria-hidden className="inline-flex size-4 shrink-0" />
           )}
           <FolderIcon isOpen={isOpen} />
-          <span className="min-w-0 truncate text-sm">{entry.name}</span>
+          <span className="min-w-0 truncate text-xs md:text-sm">{entry.name}</span>
         </div>
       </div>
       <div
