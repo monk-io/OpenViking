@@ -5,7 +5,6 @@
 Session as Context: Sessions integrated into L0/L1/L2 system.
 """
 
-import asyncio
 import json
 import re
 from dataclasses import asdict, dataclass, field
@@ -18,7 +17,12 @@ from openviking.message import Message, Part
 from openviking.message.part import ContextPart, TextPart, ToolPart
 from openviking.server.config import ToolOutputExternalizationConfig
 from openviking.server.identity import RequestContext, Role
-from openviking.session.archive_finalize_tasks import get_archive_finalize_task_store
+from openviking.session.archive_finalize_tasks import (
+    STATE_RUNNING,
+    archive_index_from_id,
+    get_archive_finalize_task_store,
+)
+from openviking.session.archive_finalizer import SessionArchiveFinalizer
 from openviking.session.tool_result_store import ToolResultStore, make_preview, sha256_text
 from openviking.telemetry import get_current_telemetry, tracer
 from openviking.utils.time_utils import get_current_timestamp
@@ -28,6 +32,7 @@ from openviking_cli.utils import get_logger, run_async
 from openviking_cli.utils.config import get_openviking_config
 
 if TYPE_CHECKING:
+    from openviking.session.archive_finalize_tasks import ArchiveFinalizeTaskStore
     from openviking.session.compressor import SessionCompressor
     from openviking.storage import VikingDBManager
     from openviking.storage.viking_fs import VikingFS
@@ -290,10 +295,13 @@ class Session:
         session_id: Optional[str] = None,
         auto_commit_threshold: int = 8000,
         tool_output_externalization_config: Optional[ToolOutputExternalizationConfig] = None,
+        archive_task_store: Optional["ArchiveFinalizeTaskStore"] = None,
     ):
         self._viking_fs = viking_fs
         self._vikingdb_manager = vikingdb_manager
         self._session_compressor = session_compressor
+        self._archive_task_store = archive_task_store
+        self._archive_finalizer = SessionArchiveFinalizer(self)
         self.user = user or UserIdentifier.the_default_user()
         self.ctx = ctx or RequestContext(user=self.user, role=Role.ROOT)
         self.session_id = session_id or str(uuid4())
@@ -969,8 +977,8 @@ class Session:
                 "trace_id": trace_id,
             }
 
-        task_store = get_archive_finalize_task_store()
-        blocking_task = task_store.get_blocking_failed(self.ctx, self.session_id)
+        task_store = self._archive_task_store or get_archive_finalize_task_store()
+        blocking_task = await task_store.get_blocking_failed_async(self.ctx, self.session_id)
         if blocking_task:
             retry_endpoint = (
                 f"/api/v1/sessions/{self.session_id}/archives/{blocking_task.archive_id}/retry"
@@ -1051,7 +1059,7 @@ class Session:
             )
 
             try:
-                task_store.create_preparing(
+                await task_store.create_preparing_async(
                     ctx=self.ctx,
                     session_id=self.session_id,
                     archive_id=archive_id,
@@ -1060,18 +1068,28 @@ class Session:
                     usage_records=[asdict(usage) for usage in self._usage_records],
                 )
                 if self._viking_fs:
+                    messages_uri = f"{archive_uri}/messages.jsonl"
                     lines = [m.to_jsonl() for m in messages_to_archive]
                     await self._viking_fs.write_file(
-                        uri=f"{archive_uri}/messages.jsonl",
+                        uri=messages_uri,
                         content="\n".join(lines) + "\n",
                         ctx=self.ctx,
                     )
+                    if not await self._viking_fs.exists(messages_uri, ctx=self.ctx):
+                        raise RuntimeError(
+                            f"archive_prepare_failed: messages.jsonl not visible at {messages_uri}"
+                        )
                 await self._write_to_agfs_async(messages=self._messages)
                 self._meta.message_count = len(self._messages)
                 self._meta.pending_tokens = 0
                 self._meta.keep_recent_count = keep_recent_count
+                self._meta.commit_count = max(
+                    self._meta.commit_count,
+                    self._compression.compression_index,
+                )
+                self._meta.last_commit_at = get_current_timestamp()
                 await self._save_meta()
-                task_store.mark_pending(self.ctx, self.session_id, archive_id)
+                await task_store.mark_pending_async(self.ctx, self.session_id, archive_id)
             except Exception as e:
                 # Rollback: restore messages so they aren't lost
                 logger.error(f"[commit] Failed to write messages.jsonl: {e}")
@@ -1086,7 +1104,7 @@ class Session:
                 except Exception:
                     logger.debug("Failed to restore session state after archive write failure")
                 try:
-                    task_store.delete(self.ctx, self.session_id, archive_id)
+                    await task_store.delete_async(self.ctx, self.session_id, archive_id)
                 except Exception:
                     logger.debug("Failed to delete incomplete archive finalize task")
                 tracker.fail(
@@ -1118,47 +1136,13 @@ class Session:
             "trace_id": trace_id,
         }
 
-    async def _write_done_file(
-        self,
-        archive_uri: str,
-        first_message_id: str,
-        last_message_id: str,
-    ) -> None:
-        """Write .done marker file to the archive directory."""
-        if not self._viking_fs:
-            return
-        content = json.dumps(
-            {
-                "starting_message_id": first_message_id,
-                "ending_message_id": last_message_id,
-            },
-            ensure_ascii=False,
-        )
-        await self._viking_fs.write_file(
-            uri=f"{archive_uri}/.done",
-            content=content,
-            ctx=self.ctx,
-        )
-
-    async def _write_failed_marker(
+    async def write_archive_failed_marker(
         self,
         archive_uri: str,
         stage: str,
         error: str,
     ) -> None:
-        """Persist a terminal failure marker for the archive."""
-        if not self._viking_fs:
-            return
-        payload = {
-            "stage": stage,
-            "error": error,
-            "failed_at": get_current_timestamp(),
-        }
-        await self._viking_fs.write_file(
-            uri=f"{archive_uri}/.failed.json",
-            content=json.dumps(payload, ensure_ascii=False),
-            ctx=self.ctx,
-        )
+        await self._archive_finalizer.write_failed_marker(archive_uri, stage, error)
 
     async def finalize_archive_from_task(
         self,
@@ -1166,181 +1150,11 @@ class Session:
         archive_uri: str,
         usage_records_payload: List[Dict[str, Any]],
     ) -> Dict[str, Any]:
-        """Finalize one persisted archive task."""
-        from openviking.service.task_tracker import get_task_tracker
-
-        tracker = get_task_tracker()
-        archive_index = self._archive_index_from_uri(archive_uri)
-        messages = await self._read_archive_messages_strict(archive_uri)
-        first_message_id = messages[0].id if messages else ""
-        last_message_id = messages[-1].id if messages else ""
-        usage_records = [Usage(**item) for item in usage_records_payload]
-        extraction_messages = await self._hydrate_tool_outputs_for_extraction(messages)
-
-        tracker.start(task_id, account_id=self.ctx.account_id, user_id=self.ctx.user.user_id)
-        latest_archive_overview = await self._get_latest_completed_archive_overview(
-            exclude_archive_uri=archive_uri
-        )
-        summary = await self._generate_archive_summary_async(
-            extraction_messages,
-            latest_archive_overview=latest_archive_overview,
-        )
-        if not summary:
-            raise RuntimeError("archive_summary_failed: empty summary")
-
-        abstract = self._extract_abstract_from_summary(summary)
-        if self._viking_fs:
-            await self._viking_fs.write_file(
-                uri=f"{archive_uri}/.abstract.md",
-                content=abstract,
-                ctx=self.ctx,
-            )
-            await self._viking_fs.write_file(
-                uri=f"{archive_uri}/.overview.md",
-                content=summary,
-                ctx=self.ctx,
-            )
-            await self._viking_fs.write_file(
-                uri=f"{archive_uri}/.meta.json",
-                content=json.dumps(
-                    {
-                        "overview_tokens": -(-len(summary) // 4),
-                        "abstract_tokens": -(-len(abstract) // 4),
-                    }
-                ),
-                ctx=self.ctx,
-            )
-
-        await self._merge_and_save_commit_meta(
-            archive_index=archive_index,
-            memories_extracted={},
-            telemetry_snapshot=None,
-        )
-        await self._write_done_file(archive_uri, first_message_id, last_message_id)
-
-        result = {
-            "session_id": self.session_id,
-            "archive_uri": archive_uri,
-            "memories_extracted": {},
-            "active_count_updated": 0,
-            "token_usage": {
-                "llm": dict(self._meta.llm_token_usage),
-                "embedding": dict(self._meta.embedding_token_usage),
-                "total": {
-                    "total_tokens": self._meta.llm_token_usage["total_tokens"]
-                    + self._meta.embedding_token_usage["total_tokens"]
-                },
-            },
-        }
-        tracker.complete(
+        return await self._archive_finalizer.finalize_from_task(
             task_id,
-            result,
-            account_id=self.ctx.account_id,
-            user_id=self.ctx.user.user_id,
+            archive_uri,
+            usage_records_payload,
         )
-        asyncio.create_task(
-            self._run_memory_side_effects_best_effort(
-                archive_uri=archive_uri,
-                messages=extraction_messages,
-                usage_records=usage_records,
-                latest_archive_overview=latest_archive_overview,
-            )
-        )
-        return result
-
-    async def _run_memory_side_effects_best_effort(
-        self,
-        archive_uri: str,
-        messages: List[Message],
-        usage_records: List[Usage],
-        latest_archive_overview: str,
-    ) -> None:
-        """Run post-.done memory side effects without blocking archive completion."""
-        memories_extracted: Dict[str, int] = {}
-        try:
-            ov_config = get_openviking_config()
-            if self._session_compressor and ov_config.memory.extraction_enabled:
-                extracted = await self._session_compressor.extract_long_term_memories(
-                    messages=messages,
-                    user=self.user,
-                    session_id=self.session_id,
-                    ctx=self.ctx,
-                    latest_archive_overview=latest_archive_overview,
-                    archive_uri=archive_uri,
-                )
-                has_agent_memory = hasattr(self._session_compressor, "extract_agent_memories")
-                agent_extracted = (
-                    await self._session_compressor.extract_agent_memories(
-                        messages=messages,
-                        ctx=self.ctx,
-                    )
-                    if has_agent_memory
-                    else []
-                )
-                for ctx_item in list(extracted or []) + list(agent_extracted or []):
-                    cat = getattr(ctx_item, "category", "") or "unknown"
-                    memories_extracted[cat] = memories_extracted.get(cat, 0) + 1
-
-            if self._viking_fs:
-                for usage in usage_records:
-                    try:
-                        await self._viking_fs.link(self._session_uri, usage.uri, ctx=self.ctx)
-                    except Exception as e:
-                        logger.warning(f"Failed to create relation to {usage.uri}: {e}")
-
-            if self._vikingdb_manager:
-                uris = [u.uri for u in usage_records if u.uri]
-                if uris:
-                    try:
-                        await self._vikingdb_manager.increment_active_count(self.ctx, uris)
-                    except Exception as e:
-                        logger.debug(f"Could not update active_count for usage URIs: {e}")
-
-            if memories_extracted:
-                await self._merge_and_save_commit_meta(
-                    archive_index=self._archive_index_from_uri(archive_uri),
-                    memories_extracted=memories_extracted,
-                    telemetry_snapshot=None,
-                )
-        except Exception as e:
-            logger.warning(
-                "Memory side effects failed for session %s archive %s: %s",
-                self.session_id,
-                archive_uri,
-                e,
-            )
-
-    def _update_active_counts(self) -> int:
-        """Update active_count for used contexts/skills."""
-        if not self._vikingdb_manager:
-            return 0
-
-        uris = [usage.uri for usage in self._usage_records if usage.uri]
-        try:
-            updated = run_async(self._vikingdb_manager.increment_active_count(self.ctx, uris))
-        except Exception as e:
-            logger.debug(f"Could not update active_count for usage URIs: {e}")
-            updated = 0
-
-        if updated > 0:
-            logger.info(f"Updated active_count for {updated} contexts/skills")
-        return updated
-
-    async def _update_active_counts_async(self) -> int:
-        """Async update active_count for used contexts/skills."""
-        if not self._vikingdb_manager:
-            return 0
-
-        uris = [usage.uri for usage in self._usage_records if usage.uri]
-        try:
-            updated = await self._vikingdb_manager.increment_active_count(self.ctx, uris)
-        except Exception as e:
-            logger.debug(f"Could not update active_count for usage URIs: {e}")
-            updated = 0
-
-        if updated > 0:
-            logger.info(f"Updated active_count for {updated} contexts/skills")
-        return updated
 
     async def get_session_context(self, token_budget: int = 128_000) -> Dict[str, Any]:
         """Get assembled session context with the latest summary archive and merged messages."""
@@ -1368,15 +1182,9 @@ class Session:
         if include_latest_overview:
             remaining_budget -= latest_archive_tokens
 
-        # pre_archive_abstracts: 保留字段返回空数组，保持 API 向下兼容
-        included_pre_archive_abstracts: List[Dict[str, str]] = []
-        pre_archive_tokens = 0
-
-        archive_tokens = latest_archive_tokens + pre_archive_tokens
-        included_archives = len(included_pre_archive_abstracts)
-        dropped_archives = max(
-            0, context["total_archives"] - context["failed_archives"] - included_archives
-        )
+        archive_tokens = latest_archive_tokens
+        included_archives = 1 if include_latest_overview else 0
+        dropped_archives = 1 if latest_archive and not include_latest_overview else 0
 
         return {
             "latest_archive_overview": (
@@ -1447,7 +1255,6 @@ class Session:
         """Collect the latest summary archive and merged pending/live messages."""
         completed_archives = await self._get_completed_archive_refs()
         latest_archive = None
-        pre_archive_abstracts: List[Dict[str, Any]] = []
         failed_archives = 0
 
         for archive in completed_archives:
@@ -1465,21 +1272,10 @@ class Session:
                         archive["archive_uri"], overview
                     ),
                 }
-            abstract = await self._read_archive_abstract(archive["archive_uri"])
-            if abstract:
-                pre_archive_abstracts.append(
-                    {
-                        "archive_id": archive["archive_id"],
-                        "abstract": abstract,
-                        "tokens": -(-len(abstract) // 4),
-                    }
-                )
-            else:
-                failed_archives += 1
+                break
 
         return {
             "latest_archive": latest_archive,
-            "pre_archive_abstracts": pre_archive_abstracts,
             "total_archives": len(completed_archives),
             "failed_archives": failed_archives,
             "messages": await self._get_pending_archive_messages() + list(self._messages),
@@ -1501,7 +1297,7 @@ class Session:
             if not name or not name.startswith("archive_"):
                 continue
             try:
-                index = int(name.split("_")[1])
+                index = archive_index_from_id(name)
             except Exception:
                 continue
 
@@ -1586,21 +1382,6 @@ class Session:
 
         return messages
 
-    async def _read_archive_messages_strict(self, archive_uri: str) -> List[Message]:
-        """Read archived messages and fail on malformed JSONL."""
-        content = await self._viking_fs.read_file(f"{archive_uri}/messages.jsonl", ctx=self.ctx)
-        messages: List[Message] = []
-        for lineno, line in enumerate(content.splitlines(), start=1):
-            if not line.strip():
-                continue
-            try:
-                messages.append(Message.from_dict(json.loads(line)))
-            except Exception as exc:
-                raise ValueError(
-                    f"Invalid messages.jsonl at {archive_uri} line {lineno}: {exc}"
-                ) from exc
-        return messages
-
     async def _get_latest_completed_archive_summary(
         self,
         exclude_archive_uri: Optional[str] = None,
@@ -1632,67 +1413,49 @@ class Session:
         return summary["overview"] if summary else ""
 
     async def _get_pending_archive_messages(self) -> List[Message]:
-        """Return messages from incomplete archives newer than the latest completed archive."""
-        latest_completed_index = 0
+        """Return messages from incomplete archives newer than the stable archive boundary."""
+        latest_done_index = 0
+        committed_index = max(0, int(self._meta.commit_count or 0))
         incomplete_archives: List[Dict[str, Any]] = []
         for archive in sorted(await self._list_archive_refs(), key=lambda item: item["index"]):
             try:
                 await self._viking_fs.read_file(f"{archive['archive_uri']}/.done", ctx=self.ctx)
-                latest_completed_index = archive["index"]
+                latest_done_index = max(latest_done_index, archive["index"])
             except Exception:
                 incomplete_archives.append(archive)
 
+        if latest_done_index:
+            include_from_index = latest_done_index + 1
+        else:
+            include_from_index = committed_index + 1
+            task_store = self._archive_task_store or get_archive_finalize_task_store()
+            tracked_incomplete_indexes: List[int] = []
+            for archive in incomplete_archives:
+                if archive["index"] > committed_index:
+                    break
+                try:
+                    task = await task_store.get_async(
+                        self.ctx, self.session_id, archive["archive_id"]
+                    )
+                except Exception:
+                    task = None
+                if not task:
+                    continue
+                tracked_incomplete_indexes.append(archive["index"])
+                if task.state == STATE_RUNNING:
+                    include_from_index = archive["index"]
+                    break
+            else:
+                if len(tracked_incomplete_indexes) >= 2:
+                    include_from_index = tracked_incomplete_indexes[0]
+
         pending_messages: List[Message] = []
         for archive in incomplete_archives:
-            if archive["index"] <= latest_completed_index:
+            if archive["index"] < include_from_index:
                 continue
             pending_messages.extend(await self._read_archive_messages(archive["archive_uri"]))
 
         return pending_messages
-
-    @staticmethod
-    def _archive_index_from_uri(archive_uri: str) -> int:
-        """Parse archive_NNN suffix into an integer index."""
-        match = re.search(r"archive_(\d+)$", archive_uri.rstrip("/"))
-        if not match:
-            raise ValueError(f"Invalid archive URI: {archive_uri}")
-        return int(match.group(1))
-
-    async def _merge_and_save_commit_meta(
-        self,
-        archive_index: int,
-        memories_extracted: Dict[str, int],
-        telemetry_snapshot: Any,
-    ) -> None:
-        """Reload and merge latest meta state before persisting commit results."""
-        latest_meta = self._meta
-        try:
-            meta_content = await self._viking_fs.read_file(
-                f"{self._session_uri}/.meta.json",
-                ctx=self.ctx,
-            )
-            latest_meta = SessionMeta.from_dict(json.loads(meta_content))
-        except Exception:
-            latest_meta = self._meta
-
-        if telemetry_snapshot:
-            llm = telemetry_snapshot.summary.get("tokens", {}).get("llm", {})
-            latest_meta.llm_token_usage["prompt_tokens"] += llm.get("input", 0)
-            latest_meta.llm_token_usage["completion_tokens"] += llm.get("output", 0)
-            latest_meta.llm_token_usage["total_tokens"] += llm.get("total", 0)
-            embedding = telemetry_snapshot.summary.get("tokens", {}).get("embedding", {})
-            latest_meta.embedding_token_usage["total_tokens"] += embedding.get("total", 0)
-
-        latest_meta.commit_count = max(latest_meta.commit_count, archive_index)
-        for cat, count in memories_extracted.items():
-            latest_meta.memories_extracted[cat] = latest_meta.memories_extracted.get(cat, 0) + count
-            latest_meta.memories_extracted["total"] = (
-                latest_meta.memories_extracted.get("total", 0) + count
-            )
-        latest_meta.last_commit_at = get_current_timestamp()
-        latest_meta.message_count = await self._read_live_message_count()
-        self._meta = latest_meta
-        await self._save_meta()
 
     async def _read_live_message_count(self) -> int:
         """Count current live session messages from persisted storage."""
@@ -2763,77 +2526,6 @@ class Session:
 
         return "\n".join(parts).rstrip() + "\n"
 
-    def _write_archive(
-        self,
-        index: int,
-        messages: List[Message],
-        abstract: str,
-        overview: str,
-    ) -> None:
-        """Write archive to history/archive_N/."""
-        if not self._viking_fs:
-            return
-
-        viking_fs = self._viking_fs
-        archive_uri = f"{self._session_uri}/history/archive_{index:03d}"
-
-        # Write messages.jsonl
-        lines = [m.to_jsonl() for m in messages]
-        run_async(
-            viking_fs.write_file(
-                uri=f"{archive_uri}/messages.jsonl",
-                content="\n".join(lines) + "\n",
-                ctx=self.ctx,
-            )
-        )
-
-        run_async(
-            viking_fs.write_file(uri=f"{archive_uri}/.abstract.md", content=abstract, ctx=self.ctx)
-        )
-        run_async(
-            viking_fs.write_file(uri=f"{archive_uri}/.overview.md", content=overview, ctx=self.ctx)
-        )
-
-        logger.debug(f"Written archive: {archive_uri}")
-
-    def _write_to_agfs(self, messages: List[Message]) -> None:
-        """Write messages.jsonl to AGFS."""
-        if not self._viking_fs:
-            return
-
-        viking_fs = self._viking_fs
-        turn_count = len([m for m in messages if m.role == "user"])
-
-        abstract = self._generate_abstract()
-        overview = self._generate_overview(turn_count)
-
-        lines = [m.to_jsonl() for m in messages]
-        content = "\n".join(lines) + "\n" if lines else ""
-
-        run_async(
-            viking_fs.write_file(
-                uri=f"{self._session_uri}/messages.jsonl",
-                content=content,
-                ctx=self.ctx,
-            )
-        )
-
-        # Update L0/L1
-        run_async(
-            viking_fs.write_file(
-                uri=f"{self._session_uri}/.abstract.md",
-                content=abstract,
-                ctx=self.ctx,
-            )
-        )
-        run_async(
-            viking_fs.write_file(
-                uri=f"{self._session_uri}/.overview.md",
-                content=overview,
-                ctx=self.ctx,
-            )
-        )
-
     async def _write_to_agfs_async(self, messages: List[Message]) -> None:
         """Write messages.jsonl to AGFS (async)."""
         if not self._viking_fs:
@@ -2957,32 +2649,6 @@ class Session:
         if self._compression.compression_index > 0:
             parts.append(f"- Historical archives: `{self._session_uri}/history/`")
         return "\n".join(parts)
-
-    def _write_relations(self) -> None:
-        """Create relations to used contexts/tools."""
-        if not self._viking_fs:
-            return
-
-        viking_fs = self._viking_fs
-        for usage in self._usage_records:
-            try:
-                run_async(viking_fs.link(self._session_uri, usage.uri, ctx=self.ctx))
-                logger.debug(f"Created relation: {self._session_uri} -> {usage.uri}")
-            except Exception as e:
-                logger.warning(f"Failed to create relation to {usage.uri}: {e}")
-
-    async def _write_relations_async(self) -> None:
-        """Create relations to used contexts/tools (async)."""
-        if not self._viking_fs:
-            return
-
-        viking_fs = self._viking_fs
-        for usage in self._usage_records:
-            try:
-                await viking_fs.link(self._session_uri, usage.uri, ctx=self.ctx)
-                logger.debug(f"Created relation: {self._session_uri} -> {usage.uri}")
-            except Exception as e:
-                logger.warning(f"Failed to create relation to {usage.uri}: {e}")
 
     # ============= Properties =============
 

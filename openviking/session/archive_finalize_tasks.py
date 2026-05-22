@@ -4,7 +4,9 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
+import re
 import sqlite3
 import time
 from dataclasses import dataclass, replace
@@ -17,6 +19,7 @@ from openviking_cli.utils.config import get_openviking_config
 
 MAX_ARCHIVE_FINALIZE_ATTEMPTS = 3
 ARCHIVE_FINALIZE_LEASE_SECONDS = 300
+ARCHIVE_FINALIZE_RETRY_DELAY_SECONDS = 1.0
 PREPARING_STALE_SECONDS = 5
 
 STATE_PREPARING = "preparing"
@@ -25,6 +28,15 @@ STATE_RUNNING = "running"
 STATE_RETRY = "retry"
 STATE_COMPLETED = "completed"
 STATE_TERMINAL_FAILED = "terminal_failed"
+_ARCHIVE_ID_RE = re.compile(r"^archive_(\d+)$")
+
+
+def archive_index_from_id(archive_id: str) -> int:
+    """Return the numeric archive index from an archive_NNN identifier."""
+    match = _ARCHIVE_ID_RE.fullmatch(archive_id)
+    if not match:
+        raise ValueError(f"Invalid archive ID: {archive_id}")
+    return int(match.group(1))
 
 
 @dataclass(frozen=True)
@@ -190,6 +202,7 @@ class ArchiveFinalizeTaskStore:
         task_tracker_id: str,
         usage_records: list[dict[str, Any]],
     ) -> None:
+        archive_index_from_id(archive_id)
         now = time.time()
         with self._connect() as conn:
             conn.execute(
@@ -217,8 +230,36 @@ class ArchiveFinalizeTaskStore:
                 ),
             )
 
+    async def create_preparing_async(
+        self,
+        *,
+        ctx: RequestContext,
+        session_id: str,
+        archive_id: str,
+        archive_uri: str,
+        task_tracker_id: str,
+        usage_records: list[dict[str, Any]],
+    ) -> None:
+        await asyncio.to_thread(
+            self.create_preparing,
+            ctx=ctx,
+            session_id=session_id,
+            archive_id=archive_id,
+            archive_uri=archive_uri,
+            task_tracker_id=task_tracker_id,
+            usage_records=usage_records,
+        )
+
     def mark_pending(self, ctx: RequestContext, session_id: str, archive_id: str) -> None:
         self._update_state(ctx, session_id, archive_id, STATE_PENDING)
+
+    async def mark_pending_async(
+        self,
+        ctx: RequestContext,
+        session_id: str,
+        archive_id: str,
+    ) -> None:
+        await asyncio.to_thread(self.mark_pending, ctx, session_id, archive_id)
 
     def delete(self, ctx: RequestContext, session_id: str, archive_id: str) -> None:
         with self._connect() as conn:
@@ -229,6 +270,14 @@ class ArchiveFinalizeTaskStore:
                 """,
                 (ctx.account_id, ctx.user.user_id, session_id, archive_id),
             )
+
+    async def delete_async(
+        self,
+        ctx: RequestContext,
+        session_id: str,
+        archive_id: str,
+    ) -> None:
+        await asyncio.to_thread(self.delete, ctx, session_id, archive_id)
 
     def get(
         self,
@@ -246,6 +295,14 @@ class ArchiveFinalizeTaskStore:
             ).fetchone()
         return self._task_from_row(row) if row else None
 
+    async def get_async(
+        self,
+        ctx: RequestContext,
+        session_id: str,
+        archive_id: str,
+    ) -> Optional[ArchiveFinalizeTask]:
+        return await asyncio.to_thread(self.get, ctx, session_id, archive_id)
+
     def get_blocking_failed(
         self,
         ctx: RequestContext,
@@ -256,12 +313,19 @@ class ArchiveFinalizeTaskStore:
                 """
                 SELECT * FROM session_archive_finalize_tasks
                 WHERE account_id=? AND user_id=? AND session_id=? AND state=?
-                ORDER BY archive_id ASC
+                ORDER BY CAST(SUBSTR(archive_id, 9) AS INTEGER) ASC, archive_id ASC
                 LIMIT 1
                 """,
                 (ctx.account_id, ctx.user.user_id, session_id, STATE_TERMINAL_FAILED),
             ).fetchone()
         return self._task_from_row(row) if row else None
+
+    async def get_blocking_failed_async(
+        self,
+        ctx: RequestContext,
+        session_id: str,
+    ) -> Optional[ArchiveFinalizeTask]:
+        return await asyncio.to_thread(self.get_blocking_failed, ctx, session_id)
 
     def claim_next(self, owner: str) -> Optional[ArchiveFinalizeTask]:
         try:
@@ -273,6 +337,9 @@ class ArchiveFinalizeTaskStore:
             self._ensure_schema()
             return None
 
+    async def claim_next_async(self, owner: str) -> Optional[ArchiveFinalizeTask]:
+        return await asyncio.to_thread(self.claim_next, owner)
+
     def _claim_next(self, owner: str) -> Optional[ArchiveFinalizeTask]:
         now = time.time()
         lease_until = now + ARCHIVE_FINALIZE_LEASE_SECONDS
@@ -281,22 +348,24 @@ class ArchiveFinalizeTaskStore:
             rows = conn.execute(
                 """
                 SELECT * FROM session_archive_finalize_tasks
-                WHERE state IN (?, ?, ?, ?)
+                WHERE state=?
+                   OR (state=? AND next_run_at<=?)
+                   OR (state=? AND lease_until<=?)
+                   OR (state=? AND created_at<=?)
                 ORDER BY created_at ASC
                 """,
-                (STATE_PREPARING, STATE_PENDING, STATE_RETRY, STATE_RUNNING),
+                (
+                    STATE_PENDING,
+                    STATE_RETRY,
+                    now,
+                    STATE_RUNNING,
+                    now,
+                    STATE_PREPARING,
+                    now - PREPARING_STALE_SECONDS,
+                ),
             ).fetchall()
             for row in rows:
                 task = self._task_from_row(row)
-                if (
-                    task.state == STATE_PREPARING
-                    and task.created_at + PREPARING_STALE_SECONDS > now
-                ):
-                    continue
-                if task.state == STATE_RETRY and task.next_run_at > now:
-                    continue
-                if task.state == STATE_RUNNING and task.lease_until > now:
-                    continue
                 if self._has_active_session_task(conn, task, now):
                     continue
                 if self._has_incomplete_prior_task(conn, task):
@@ -350,6 +419,9 @@ class ArchiveFinalizeTaskStore:
                 ),
             )
 
+    async def complete_async(self, task: ArchiveFinalizeTask) -> None:
+        await asyncio.to_thread(self.complete, task)
+
     def release(self, task: ArchiveFinalizeTask) -> None:
         now = time.time()
         with self._connect() as conn:
@@ -371,6 +443,9 @@ class ArchiveFinalizeTaskStore:
                 ),
             )
 
+    async def release_async(self, task: ArchiveFinalizeTask) -> None:
+        await asyncio.to_thread(self.release, task)
+
     def fail(self, task: ArchiveFinalizeTask, error: str) -> str:
         now = time.time()
         attempt_count = task.attempt_count + 1
@@ -378,7 +453,7 @@ class ArchiveFinalizeTaskStore:
         next_run_at = 0.0
         if attempt_count < MAX_ARCHIVE_FINALIZE_ATTEMPTS:
             state = STATE_RETRY
-            next_run_at = now
+            next_run_at = now + ARCHIVE_FINALIZE_RETRY_DELAY_SECONDS
         with self._connect() as conn:
             conn.execute(
                 """
@@ -400,6 +475,9 @@ class ArchiveFinalizeTaskStore:
                 ),
             )
         return state
+
+    async def fail_async(self, task: ArchiveFinalizeTask, error: str) -> str:
+        return await asyncio.to_thread(self.fail, task, error)
 
     def reset_for_retry(
         self,
@@ -434,6 +512,18 @@ class ArchiveFinalizeTaskStore:
                 (task.account_id, task.user_id, task.session_id, task.archive_id),
             ).fetchone()
         return self._task_from_row(row)
+
+    async def reset_for_retry_async(
+        self,
+        task: ArchiveFinalizeTask,
+        *,
+        task_tracker_id: str,
+    ) -> ArchiveFinalizeTask:
+        return await asyncio.to_thread(
+            self.reset_for_retry,
+            task,
+            task_tracker_id=task_tracker_id,
+        )
 
     def _update_state(
         self,
@@ -485,7 +575,9 @@ class ArchiveFinalizeTaskStore:
             """
             SELECT 1 FROM session_archive_finalize_tasks
             WHERE account_id=? AND user_id=? AND session_id=?
-              AND archive_id<? AND state<>?
+              AND CAST(SUBSTR(archive_id, 9) AS INTEGER)
+                  < CAST(SUBSTR(?, 9) AS INTEGER)
+              AND state<>?
             LIMIT 1
             """,
             (

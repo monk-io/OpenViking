@@ -125,11 +125,11 @@ def test_start_task(tracker: TaskTracker):
 def test_complete_task(tracker: TaskTracker):
     task = tracker.create("session_commit", resource_id="s1", **_owner_kwargs())
     tracker.start(task.task_id)
-    tracker.complete(task.task_id, {"memories_extracted": 3})
+    tracker.complete(task.task_id, {"archive_uri": "viking://session/s1/history/archive_001"})
     retrieved = tracker.get(task.task_id)
     assert retrieved is not None
     assert retrieved.status == TaskStatus.COMPLETED
-    assert retrieved.result == {"memories_extracted": 3}
+    assert retrieved.result == {"archive_uri": "viking://session/s1/history/archive_001"}
 
 
 def test_fail_task(tracker: TaskTracker):
