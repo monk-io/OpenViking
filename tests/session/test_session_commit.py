@@ -4,7 +4,7 @@
 """Commit tests"""
 
 import asyncio
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -41,7 +41,12 @@ async def _drain_archive_finalize_once() -> bool:
     store = service._archive_task_store
     if store is None:
         return False
-    task = await store.claim_next_async("test-session-archive-finalizer")
+    task = None
+    for _ in range(10):
+        task = await store.claim_next_async("test-session-archive-finalizer")
+        if task is not None:
+            break
+        await asyncio.sleep(0.01)
     if task is None:
         return False
     await service._process_archive_finalize_task(store, task)
@@ -71,6 +76,68 @@ class TestCommit:
         task_result = await _wait_for_task(task_id)
         assert task_result["status"] == "completed"
         assert task_result["result"]["archive_uri"] == result["archive_uri"]
+
+    async def test_commit_reports_session_skills_separately(
+        self, session_with_messages: Session, monkeypatch
+    ):
+        config = MagicMock()
+        config.memory.extraction_enabled = False
+        config.memory.session_skill_extraction_enabled = True
+        monkeypatch.setattr("openviking.session.session.get_openviking_config", lambda: config)
+        monkeypatch.setattr(
+            "openviking.session.archive_finalizer.get_openviking_config", lambda: config
+        )
+
+        session_with_messages._session_compressor.extract_long_term_memories = AsyncMock(
+            return_value=[]
+        )
+        if hasattr(session_with_messages._session_compressor, "extract_agent_memories"):
+            session_with_messages._session_compressor.extract_agent_memories = AsyncMock(
+                return_value={
+                    "contexts": [],
+                    "session_skills": [{"uri": "viking://account/test/agent/skills/code-review"}],
+                }
+            )
+
+        result = await session_with_messages.commit_async()
+        task_result = await _wait_for_task(result["task_id"])
+
+        assert task_result["status"] == "completed"
+        assert task_result["result"]["memories_extracted"] == {}
+        assert task_result["result"]["session_skills_extracted"] == 1
+        assert task_result["result"]["session_skill_uris"] == [
+            "viking://account/test/agent/skills/code-review"
+        ]
+        session_with_messages._session_compressor.extract_long_term_memories.assert_not_awaited()
+        session_with_messages._session_compressor.extract_agent_memories.assert_awaited_once()
+
+    async def test_commit_skips_session_skill_extraction_when_disabled(
+        self, session_with_messages: Session, monkeypatch
+    ):
+        config = MagicMock()
+        config.memory.extraction_enabled = True
+        config.memory.session_skill_extraction_enabled = False
+        monkeypatch.setattr("openviking.session.session.get_openviking_config", lambda: config)
+        monkeypatch.setattr(
+            "openviking.session.archive_finalizer.get_openviking_config", lambda: config
+        )
+
+        session_with_messages._session_compressor.extract_long_term_memories = AsyncMock(
+            return_value=[]
+        )
+        if hasattr(session_with_messages._session_compressor, "extract_agent_memories"):
+            session_with_messages._session_compressor.extract_agent_memories = AsyncMock(
+                return_value={"contexts": [], "session_skills": []}
+            )
+
+        result = await session_with_messages.commit_async()
+        task_result = await _wait_for_task(result["task_id"])
+
+        assert task_result["status"] == "completed"
+        assert task_result["result"]["session_skills_extracted"] == 0
+        assert task_result["result"]["session_skill_uris"] == []
+        session_with_messages._session_compressor.extract_long_term_memories.assert_awaited_once()
+        session_with_messages._session_compressor.extract_agent_memories.assert_awaited_once()
 
     async def test_commit_archives_messages(self, session_with_messages: Session):
         """Test commit archives messages"""
@@ -137,38 +204,11 @@ class TestCommit:
         await _wait_until(lambda: "extract" in seen)
         assert seen["extract"] == previous_overview
 
-    async def test_active_count_incremented_after_commit(self, client: AsyncOpenViking):
-        """Regression test: active_count must actually increment after commit.
-
-        Archive finalization completes before best-effort memory side effects,
-        so this assertion waits for the side effect to update storage.
-        """
-        uri = "viking://resources/active-count-regression.md"
+    async def test_active_count_incremented_after_commit(self, client_with_resource_sync: tuple):
+        client, uri = client_with_resource_sync
         vikingdb = client._client.service.vikingdb_manager
         # Use the client's own context to match the account_id used when adding the resource
         client_ctx = client._client._ctx
-        await vikingdb.upsert(
-            {
-                "id": "active-count-regression",
-                "uri": uri,
-                "type": "file",
-                "context_type": "resource",
-                "vector": [0.1] * 1024,
-                "sparse_vector": {},
-                "created_at": "2026-01-01T00:00:00+00:00",
-                "updated_at": "2026-01-01T00:00:00+00:00",
-                "active_count": 0,
-                "level": 2,
-                "name": "active-count-regression.md",
-                "description": "",
-                "tags": "",
-                "abstract": "active count regression fixture",
-                "account_id": client_ctx.account_id,
-                "owner_user_id": client_ctx.user.user_id,
-                "owner_agent_id": client_ctx.user.agent_id,
-            },
-            ctx=client_ctx,
-        )
 
         # Look up the record by URI
         records_before = await vikingdb.get_context_by_uri(
@@ -189,6 +229,7 @@ class TestCommit:
         # Wait for background task to complete (active_count is updated there)
         task_result = await _wait_for_task(result["task_id"])
         assert task_result["status"] == "completed"
+        assert task_result["result"]["active_count_updated"] == 1
 
         # Verify the count actually changed in storage
         records_after = []

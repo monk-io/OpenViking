@@ -4,7 +4,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import json
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Dict, List
@@ -107,12 +106,20 @@ class SessionArchiveFinalizer:
             telemetry_snapshot=None,
         )
         await self.write_done_file(archive_uri, first_message_id, last_message_id)
+        side_effect_result = await self._run_memory_side_effects_best_effort(
+            archive_uri=archive_uri,
+            messages=extraction_messages,
+            usage_records=usage_records,
+            latest_archive_overview=latest_archive_overview,
+        )
 
         result = {
             "session_id": session.session_id,
             "archive_uri": archive_uri,
-            "memories_extracted": {},
-            "active_count_updated": 0,
+            "memories_extracted": side_effect_result["memories_extracted"],
+            "session_skills_extracted": len(side_effect_result["session_skill_uris"]),
+            "session_skill_uris": side_effect_result["session_skill_uris"],
+            "active_count_updated": side_effect_result["active_count_updated"],
             "token_usage": {
                 "llm": dict(session._meta.llm_token_usage),
                 "embedding": dict(session._meta.embedding_token_usage),
@@ -127,14 +134,6 @@ class SessionArchiveFinalizer:
             result,
             account_id=session.ctx.account_id,
             user_id=session.ctx.user.user_id,
-        )
-        asyncio.create_task(
-            self._run_memory_side_effects_best_effort(
-                archive_uri=archive_uri,
-                messages=extraction_messages,
-                usage_records=usage_records,
-                latest_archive_overview=latest_archive_overview,
-            )
         )
         return result
 
@@ -235,33 +234,50 @@ class SessionArchiveFinalizer:
         messages: List[Message],
         usage_records: List[ArchiveUsageRecord],
         latest_archive_overview: str,
-    ) -> None:
-        """Run post-.done memory side effects without blocking archive completion."""
+    ) -> Dict[str, Any]:
+        """Run post-.done side effects without making archive completion fail."""
         session = self._session
         memories_extracted: Dict[str, int] = {}
+        session_skill_uris: List[str] = []
+        active_count_updated = 0
         try:
             ov_config = get_openviking_config()
-            if session._session_compressor and ov_config.memory.extraction_enabled:
-                extracted = await session._session_compressor.extract_long_term_memories(
-                    messages=messages,
-                    user=session.user,
-                    session_id=session.session_id,
-                    ctx=session.ctx,
-                    latest_archive_overview=latest_archive_overview,
-                    archive_uri=archive_uri,
-                )
+            memory_extraction_enabled = bool(ov_config.memory.extraction_enabled)
+            session_skill_extraction_enabled = bool(
+                getattr(ov_config.memory, "session_skill_extraction_enabled", False)
+            )
+            if session._session_compressor and (
+                memory_extraction_enabled or session_skill_extraction_enabled
+            ):
+                extracted = []
+                if memory_extraction_enabled:
+                    extracted = await session._session_compressor.extract_long_term_memories(
+                        messages=messages,
+                        user=session.user,
+                        session_id=session.session_id,
+                        ctx=session.ctx,
+                        latest_archive_overview=latest_archive_overview,
+                        archive_uri=archive_uri,
+                    )
                 has_agent_memory = hasattr(session._session_compressor, "extract_agent_memories")
-                agent_extracted = (
-                    await session._session_compressor.extract_agent_memories(
+                agent_result: Dict[str, List[Any]] = {"contexts": [], "session_skills": []}
+                if has_agent_memory:
+                    agent_result = await session._session_compressor.extract_agent_memories(
                         messages=messages,
                         ctx=session.ctx,
+                        latest_archive_overview=latest_archive_overview,
+                        archive_uri=archive_uri,
                     )
-                    if has_agent_memory
-                    else []
-                )
-                for ctx_item in list(extracted or []) + list(agent_extracted or []):
+                agent_extracted = list(agent_result.get("contexts", []))
+                session_skills = list(agent_result.get("session_skills", []))
+                for ctx_item in list(extracted or []) + agent_extracted:
                     cat = getattr(ctx_item, "category", "") or "unknown"
                     memories_extracted[cat] = memories_extracted.get(cat, 0) + 1
+                session_skill_uris = [
+                    item.get("uri") or item.get("root_uri")
+                    for item in session_skills
+                    if isinstance(item, dict) and (item.get("uri") or item.get("root_uri"))
+                ]
 
             if session._viking_fs:
                 for usage in usage_records:
@@ -278,7 +294,11 @@ class SessionArchiveFinalizer:
                 uris = [u.uri for u in usage_records if u.uri]
                 if uris:
                     try:
-                        await session._vikingdb_manager.increment_active_count(session.ctx, uris)
+                        active_count_updated = (
+                            await session._vikingdb_manager.increment_active_count(
+                                session.ctx, uris
+                            )
+                        )
                     except Exception as e:
                         logger.debug(f"Could not update active_count for usage URIs: {e}")
 
@@ -295,6 +315,11 @@ class SessionArchiveFinalizer:
                 archive_uri,
                 e,
             )
+        return {
+            "memories_extracted": memories_extracted,
+            "session_skill_uris": session_skill_uris,
+            "active_count_updated": active_count_updated,
+        }
 
     async def _merge_and_save_commit_meta(
         self,
