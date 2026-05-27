@@ -16,6 +16,10 @@ from openviking_cli.utils import get_logger
 logger = get_logger(__name__)
 
 
+_MEMORY_FIELDS_PATTERN = r"<!--\s*MEMORY_FIELDS\s*([\s\S]*?)\s*-->"
+_VERSION_HISTORY_PATTERN = r"<!--\s*VERSION_HISTORY\s*([\s\S]*?)\s*-->"
+
+
 def pretty_print_messages(messages: List[Dict[str, Any]]) -> None:
     """
     Print messages in a human-readable format.
@@ -92,29 +96,39 @@ def parse_memory_file_with_fields(content: str) -> Dict[str, Any]:
     if not content:
         return {"content": ""}
 
-    # Pattern to match: <!-- MEMORY_FIELDS ... -->
-    # Matches multi-line JSON inside the comment
-    pattern = r"<!--\s*MEMORY_FIELDS\s*([\s\S]*?)\s*-->"
-
-    match = re.search(pattern, content)
-
     result = {}
 
-    if match:
-        fields_json_str = match.group(1).strip()
-        if fields_json_str:
-            try:
-                fields = json_repair.loads(fields_json_str)
-                # If it's a list, take the first item (just in case)
-                if isinstance(fields, list) and len(fields) > 0:
-                    fields = fields[0]
-                if isinstance(fields, dict):
-                    result.update(fields)
-            except Exception as e:
-                tracer.warning(f"Failed to parse MEMORY_FIELDS JSON: {e}")
+    memory_fields = _parse_json_comment(content, _MEMORY_FIELDS_PATTERN, "MEMORY_FIELDS")
+    if isinstance(memory_fields, dict):
+        result.update(memory_fields)
 
-    # Remove the comment from content
-    content_without_comment = re.sub(pattern, "", content).strip()
+    version_history = _parse_json_comment(content, _VERSION_HISTORY_PATTERN, "VERSION_HISTORY")
+    if isinstance(version_history, dict):
+        result["version_history"] = version_history
+
+    # Remove comments from content
+    content_without_comment = re.sub(_MEMORY_FIELDS_PATTERN, "", content)
+    content_without_comment = re.sub(_VERSION_HISTORY_PATTERN, "", content_without_comment).strip()
     result["content"] = content_without_comment
 
     return result
+
+
+def _parse_json_comment(content: str, pattern: str, label: str) -> Dict[str, Any] | None:
+    match = re.search(pattern, content)
+    if not match:
+        return None
+
+    fields_json_str = match.group(1).strip()
+    if not fields_json_str:
+        return None
+
+    try:
+        fields = json_repair.loads(fields_json_str)
+        if isinstance(fields, list) and len(fields) > 0:
+            fields = fields[0]
+        if isinstance(fields, dict):
+            return fields
+    except Exception as e:
+        tracer.warning(f"Failed to parse {label} JSON: {e}")
+    return None

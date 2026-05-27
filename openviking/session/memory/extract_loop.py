@@ -183,7 +183,7 @@ class ExtractLoop:
 ## Read Format Rules
 - The read tool accepts `uri`, optional `offset` (0-indexed), and optional `limit`.
 - Read content is returned in Claude Code format: each visible line is prefixed with `line_number<TAB>`.
-- When you copy text from read results into SEARCH/REPLACE operations, copy the exact text after the line-number prefix. Never include the line-number prefix itself in `search` or `replace`.
+- For patch fields, output only the JSON form defined by the schema using `blocks[].search` and `blocks[].replace`. Never output plain text such as `SEARCH:` or `REPLACE:`. When copying text from read results, use the exact text after the line-number prefix. Never include the prefix itself.
 ## Output Format
 The final output of the model must strictly follow the JSON Schema format shown below:
 ```json

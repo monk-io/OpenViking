@@ -31,7 +31,9 @@ class PatchOp(MergeOpBase):
 
     def get_output_schema_description(self, field_description: str) -> str:
         if self._field_type == FieldType.STRING:
-            return f"PATCH operation for '{field_description}'. Follow the shared SEARCH/REPLACE rules above."
+            return (
+                f"PATCH operation for '{field_description}'. Follow the shared patch rules above."
+            )
         return f"Replace value for '{field_description}'"
 
     def apply(self, current_value: Any, patch_value: Any) -> Any:

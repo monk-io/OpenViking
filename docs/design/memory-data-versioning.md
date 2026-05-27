@@ -85,7 +85,7 @@ search(query, data_version=X)
 - 采用逻辑删除
 - 默认检索不返回已删除文件
 - 历史版本仍可恢复
-- 删除时保留删除前最后正文，仅通过 metadata 标记 deleted
+- 删除时保留删除前最后正文，仅通过 `VERSION_HISTORY.status = "deleted"` 标记当前状态
 
 ### 9. checkpoint / compact
 
@@ -93,6 +93,47 @@ search(query, data_version=X)
 
 - 先使用“最新正文 + reverse diff 链”
 - 后续通过 compact 机制压缩历史版本
+
+### 10. diff 算法
+
+- 使用 `diff-match-patch` 生成和应用整文件 reverse diff
+- 不自定义 diff 格式
+
+### 11. 历史读取与恢复范围
+
+- 仅支持按版本 `search` 和按版本 `read`
+- 一期不提供 `restore` / `rollback` 接口
+- 历史版本仅用于查看，不用于将旧版本恢复成新的 head
+
+### 12. 历史版本保留策略
+
+- 每个记忆文件最多保留最近 **100** 个历史版本
+- 超过 100 个版本时，直接丢弃最老版本
+- 一期不做 checkpoint，不做 compact 合并
+
+### 13. 并发与锁策略
+
+- 写入 `memory_file` 时必须加锁
+- 锁粒度为单文件级别（per-memory-file exclusive lock）
+- 同一时刻只允许一个写入流程修改同一个 memory file
+- 历史读取时不加读锁
+- 读取正确性依赖写锁和原子落盘保证
+
+### 14. 历史数据兼容性
+
+- 需要兼容已存在但不包含 `VERSION_HISTORY` 的历史 memory file
+- 对于这类文件，系统应将其视为仅包含当前 head 的单版本文件
+- 读取当前版本时应正常工作，不要求强制迁移
+- 当按 `data_version` 读取或检索时，当前文件版本的判断顺序为：
+  1. 优先使用 `VERSION_HISTORY.data_version`
+  2. 若缺失，则退化为 `VERSION_HISTORY.updated_at`
+  3. 若两者都缺失，则视为版本未知的历史数据单版本文件
+- 对于版本未知的历史数据单版本文件：
+  - 不传 `data_version` 时可正常返回当前内容
+  - 传入 `data_version` 时，不参与历史判断，直接视为不存在可用版本
+- 若请求版本大于等于该文件当前可判定版本，则可直接返回当前内容
+- 若请求版本早于该文件当前可判定版本，则视为不存在可用版本，不应返回该文件
+- 历史文件在后续第一次被新版写入后，可自动补齐 `VERSION_HISTORY`
 
 ---
 
@@ -144,18 +185,16 @@ search(query, data_version=X)
 
 <!-- MEMORY_FIELDS
 {
-  "memory_type": "preferences",
-  "updated_at": "2026-05-27T15:10:23.456Z",
-  "data_version": 1780000000123,
-  "deleted": false,
-  "deleted_at": null
+  "memory_type": "preferences"
 }
 -->
 
 <!-- VERSION_HISTORY
 {
-  "head_data_version": 1780000000123,
-  "entries": [
+  "data_version": 1780000000123,
+  "updated_at": "2026-05-27T15:10:23.456Z",
+  "status": "active",
+  "versions": [
     {
       "data_version": 1780000000123,
       "op": "update",
@@ -180,20 +219,29 @@ search(query, data_version=X)
 
 ## 版本语义
 
-### 1. `head_data_version`
+### 1. `VERSION_HISTORY.data_version`
 
 表示当前文件正文对应的最新版本。
 
-### 2. `entries`
+### 2. `VERSION_HISTORY.status`
 
-每条 entry 表示：
+表示当前正文在当前版本下的状态。
+
+建议值：
+
+- `active`
+- `deleted`
+
+### 3. `versions`
+
+每个 version item 表示：
 
 - 当前这版如何回退到上一版
 
 例如：
 
-- `v3` entry 保存 `v3 -> v2` 的 reverse diff
-- `v2` entry 保存 `v2 -> v1` 的 reverse diff
+- `v3` version 保存 `v3 -> v2` 的 reverse diff
+- `v2` version 保存 `v2 -> v1` 的 reverse diff
 
 因此，版本链方向是：
 
@@ -224,9 +272,10 @@ data_version = max(now_ms, last_data_version + 1)
 
 - 写入最新正文
 - 设置：
-  - `MEMORY_FIELDS.data_version = 当前 batch data_version`
-  - `deleted = false`
-- `VERSION_HISTORY.entries` 追加：
+  - `VERSION_HISTORY.data_version = 当前 batch data_version`
+  - `VERSION_HISTORY.updated_at = 当前写入时间`
+  - `VERSION_HISTORY.status = "active"`
+- `VERSION_HISTORY.versions` 追加：
   - `op = create`
   - `reverse_diff = null`
 
@@ -243,8 +292,8 @@ new_full_text -> old_full_text
 ```
 
 4. 写入新正文与新 `MEMORY_FIELDS`
-5. 更新 `head_data_version`
-6. 在 `VERSION_HISTORY.entries` 追加：
+5. 更新 `VERSION_HISTORY.data_version`、`VERSION_HISTORY.updated_at`、`VERSION_HISTORY.status`
+6. 在 `VERSION_HISTORY.versions` 追加：
    - `data_version = 当前 batch data_version`
    - `op = update`
    - `reverse_diff = ...`
@@ -255,12 +304,12 @@ new_full_text -> old_full_text
 
 1. 不删除正文
 2. 写入：
-   - `deleted = true`
-   - `deleted_at = now`
-   - `data_version = 当前 batch data_version`
+   - `VERSION_HISTORY.status = "deleted"`
+   - `VERSION_HISTORY.updated_at = now`
+   - `VERSION_HISTORY.data_version = 当前 batch data_version`
 3. 追加版本记录：
    - `op = delete`
-   - `reverse_diff = 当前 deleted 状态 -> 删除前状态`
+   - `reverse_diff = 当前 status=deleted 状态 -> 删除前状态`
 
 这样历史还原时即可恢复删除前内容。
 
@@ -279,23 +328,24 @@ materialize_memory_at_version(file_uri, data_version)
 #### 不传 `data_version`
 
 - 直接返回当前 head 内容
-- 若当前 `deleted = true`，则默认视为不可见
+- 若当前 `VERSION_HISTORY.status = "deleted"`，则默认视为不可见
 
 #### 传入 `data_version = X`
 
 流程：
 
 1. 读取最新文件正文与 metadata
-2. 获取 `head_data_version`
+2. 获取 `VERSION_HISTORY.data_version`（当前正文版本）
 3. 若文件不存在任何 `<= X` 的历史版本：
    - 说明该文件在该版本视角下不存在可用状态，返回 not found / not visible
-4. 若 `head_data_version <= X`：
+   - 对于不包含 `VERSION_HISTORY` 的历史文件，应按“仅存在当前 head 单版本”处理
+4. 若 `VERSION_HISTORY.data_version <= X`：
    - 直接返回当前版本
-5. 否则，从新到旧遍历 `VERSION_HISTORY.entries`
+5. 否则，从新到旧遍历 `VERSION_HISTORY.versions`
 6. 对所有 `entry.data_version > X` 的记录依次应用 `reverse_diff`
 7. 得到目标版本完整文本
-8. 解析目标版本下的 `MEMORY_FIELDS`
-9. 若该版本 `deleted = true`，则该版本不可见；否则返回
+8. 解析目标版本下的 `MEMORY_FIELDS` 与 `VERSION_HISTORY`
+9. 若该版本 `VERSION_HISTORY.status = "deleted"`，则该版本不可见；否则返回
 
 ---
 
@@ -324,9 +374,9 @@ materialize_memory_at_version(uri, data_version)
 #### Step 3：过滤删除态
 
 - 当 `data_version is None`：
-  - 过滤当前 `deleted = true` 的文件
+  - 过滤当前 `VERSION_HISTORY.status = "deleted"` 的文件
 - 当指定 `data_version`：
-  - 如果该历史版本为 deleted，则该文件不可见
+  - 如果该历史版本的 `status = "deleted"`，则该文件不可见
 
 #### Step 4：返回还原内容
 
@@ -387,20 +437,34 @@ materialize_memory_at_version(uri, data_version)
 - 老版本快照化
 - 版本链裁剪
 
+### 4. 版本历史上限
+
+一期直接限制：
+
+- 每个文件最多保留最近 100 个历史版本
+- 超过上限时，丢弃最老版本 item
+
+这意味着非常老的历史版本可能不可恢复。
+
+### 5. 单文件写锁
+
+写入 memory file 时必须加单文件排他锁：
+
+- 锁对象建议使用 memory file URI
+- 锁覆盖范围包括：读取旧版本、生成 reverse diff、更新正文、更新 `MEMORY_FIELDS`、更新 `VERSION_HISTORY`
+- 目的是保证版本链一致性，避免并发写入导致 diff 基线错误或历史链损坏
+
 ---
 
 ## 建议 metadata 字段
 
 ### `MEMORY_FIELDS`
 
-建议增加或统一以下字段：
+只保留业务元数据，例如：
 
 ```json
 {
-  "data_version": 1780000000123,
-  "updated_at": "2026-05-27T15:10:23.456Z",
-  "deleted": false,
-  "deleted_at": null
+  "memory_type": "preferences"
 }
 ```
 
@@ -410,8 +474,10 @@ materialize_memory_at_version(uri, data_version)
 
 ```json
 {
-  "head_data_version": 1780000000123,
-  "entries": [
+  "data_version": 1780000000123,
+  "updated_at": "2026-05-27T15:10:23.456Z",
+  "status": "active",
+  "versions": [
     {
       "data_version": 1780000000123,
       "op": "update",
@@ -453,17 +519,10 @@ search(query, data_version=None)
 delete_memory(uri, data_version=batch_data_version)
 ```
 
-### 4. 恢复某历史版本为新 head
+说明：
 
-```python
-restore_memory(uri, target_data_version)
-```
-
-恢复语义建议：
-
-- 先 materialize 到旧版本
-- 再以一个新的 `data_version` 写成最新 head
-- 不直接篡改历史链
+- 一期不提供 `restore_memory` 或回滚接口
+- 历史版本仅支持按版本读取与按版本检索
 
 ---
 
@@ -475,7 +534,7 @@ restore_memory(uri, target_data_version)
 - 与当前 memory file 体系兼容
 - 不需要多版本向量索引
 - 单文件自包含历史
-- 支持逻辑删除与历史恢复
+- 支持逻辑删除与历史视图读取
 
 ### 缺点
 
@@ -498,13 +557,13 @@ restore_memory(uri, target_data_version)
 ### Phase 2：读取与删除
 
 4. 支持 `read_memory(..., data_version=...)`
-5. 实现逻辑删除及其历史恢复
+5. 实现逻辑删除及其历史可见性控制
 
 ### Phase 3：检索接入
 
 6. 支持 `search(..., data_version=...)`
 7. 检索后对候选文件做历史还原
-8. 过滤 deleted 文件
+8. 过滤 `status = "deleted"` 的文件
 
 ### Phase 4：后续优化
 
@@ -531,3 +590,587 @@ restore_memory(uri, target_data_version)
 - 先完成可用版本化能力
 - 后续再通过 compact / checkpoint 增强性能与健壮性
 
+
+---
+
+## 代码改造点清单
+
+以下清单基于当前仓库代码结构，目标是把本设计落到现有 memory 写入、读取、检索链路中。
+
+### 1. `openviking/session/memory/utils/memory_file_utils.py`
+
+**职责：** 扩展 memory file 的解析与写回能力，支持 `VERSION_HISTORY`。
+
+**建议改造：**
+
+- 在现有 `MEMORY_FIELDS` 解析逻辑之外，增加 `VERSION_HISTORY` 注释块的读取与写入。
+- 提供“参与 diff 的业务文本”序列化方法：
+  - 包含正文
+  - 包含普通 `MEMORY_FIELDS`
+  - 不包含 `VERSION_HISTORY`
+- 提供完整文件读写方法：
+  - `read(...)` 继续兼容当前 `MemoryFile`
+  - 新增类似 `read_version_history(...)`
+  - 新增类似 `write_with_version_history(...)`
+- 提供基于 `diff-match-patch` 的 helper：
+  - 生成 reverse diff
+  - 应用 reverse diff
+
+**建议新增能力：**
+
+- `extract_business_text(raw_content)`
+- `parse_version_history(raw_content)`
+- `append_version_entry(...)`
+- `materialize_text_at_version(...)`
+
+---
+
+### 1.1 `openviking/session/memory/utils/memory_version_utils.py`
+
+**职责：** 承载版本解析、历史版本还原、可见性判断等版本领域工具能力。
+
+**建议新增能力：**
+
+- `materialize_memory_at_version(...)`（建议放在 `memory_version_utils.py`）
+- `resolve_version_for_data_version(...)`
+- `is_version_visible(...)`
+- `trim_versions(...)`
+
+**说明：**
+
+- `memory_file_utils.py` 负责 memory file 编解码与底层 diff/patch 辅助
+- `memory_version_utils.py` 负责版本选择、reverse diff 回放、历史数据兼容与可见性判断
+
+---
+
+### 2. `openviking/session/memory/dataclass.py`
+
+**职责：** 扩展 memory file / version history 的结构定义。
+
+**建议改造：**
+
+- 为版本记录新增 dataclass / pydantic model，例如：
+  - `VersionHistoryEntry`
+  - `VersionHistory`
+- 为 `MemoryFile` 增加版本相关字段，例如：
+  - `version_history`
+  - `version_status`（或等价字段）
+  - `version_data_version`（或等价字段）
+
+**注意：**
+
+- `version_history` 不应混入普通 `extra_fields` 的 diff 基线文本。
+
+---
+
+### 3. `openviking/session/memory/memory_updater.py`
+
+**职责：** 在 memory upsert 时生成版本链。
+
+**这是核心改造点。**
+
+**建议改造：**
+
+- 在 `_apply_upsert(...)` 中：
+  1. 读取旧文件完整内容
+  2. 生成新文件完整内容（正文 + 普通 `MEMORY_FIELDS`）
+  3. 计算 `new -> old` 的 reverse diff
+  4. 更新 `VERSION_HISTORY`
+  5. 写回最新正文 + 新 metadata + 新 version history
+- 在 delete 路径中支持逻辑删除：
+  - 不物理删除文件
+  - 改为写 `VERSION_HISTORY.status = "deleted"`
+  - 写入 delete 对应的 reverse diff
+- 增加单文件写锁，锁住整个“读旧内容 → 生成 diff → 写回”过程。
+
+**建议新增入参或上下文：**
+
+- `data_version`
+  - 由 batch 级流程统一生成后传入
+
+**建议处理的边界：**
+
+- 新文件：`create`
+- 普通更新：`update`
+- 逻辑删除：`delete`
+- 超过 100 个历史版本时裁剪最老 entry
+
+---
+
+### 4. `openviking/session/compressor_v2.py`
+
+**职责：** 作为一次 memory apply batch 的组织入口，统一生成 `data_version`。
+
+**建议改造：**
+
+- 在 memory update batch 开始时生成统一的 `data_version`：
+
+```python
+data_version = max(now_ms, last_data_version + 1)
+```
+
+- 将该 `data_version` 传给：
+  - memory upsert
+  - memory delete
+  - `memory_diff.json` 审计日志
+- 在 `memory_diff.json` 中追加本次 batch 的 `data_version`，便于后续排查与审计。
+
+**建议新增：**
+
+- batch 级 `data_version` 生成函数
+- 全局最近版本号持久化位置（可后续再定）
+
+---
+
+### 5. `openviking/session/session.py`
+
+**职责：** 如果对外暴露 session 级 search / read，需要支持 `data_version` 透传。
+
+**建议改造：**
+
+- 在相关 `search` / `read` / context retrieval 接口上增加：
+  - `data_version: Optional[int] = None`
+- 将 `data_version` 传入底层 VikingFS 或 memory materialization 流程。
+
+---
+
+### 6. `openviking/storage/viking_fs.py`
+
+**职责：** 检索入口支持 `data_version` 过滤后的 materialization。
+
+**建议改造：**
+
+- 在 `search(...)` 增加参数：
+  - `data_version: Optional[int] = None`
+- 当前搜索逻辑保持不变：
+  - 仍然基于最新向量索引召回
+- 在结果返回前增加一个后处理阶段：
+  - 如果结果是 memory file，且指定了 `data_version`
+  - 则调用 materialize 逻辑恢复目标版本
+  - 若不存在 `<= data_version` 的可用版本，则过滤掉该结果
+  - 若目标版本的 `status = "deleted"`，也过滤掉
+
+**建议新增内部 helper：**
+
+- `_materialize_search_result_at_data_version(...)`
+  - 内部建议复用 `memory_version_utils.py`
+
+---
+
+### 7. `openviking/session/memory/tools.py`
+
+**职责：** 如果 memory 工具对外提供 `read` / `search`，需要暴露 `data_version`。
+
+**建议改造：**
+
+- memory read tool 增加 `data_version`
+- memory search tool 增加 `data_version`
+- tool 输出要能明确区分：
+  - 当前版本内容
+  - 历史版本视图内容
+
+---
+
+### 8. `openviking/storage/content_write.py`
+
+**职责：** 如果存在绕过 `MemoryUpdater` 的 memory 写入路径，需要检查并收口。
+
+**建议改造：**
+
+- 检查所有 memory write 是否都能统一走版本化写入逻辑
+- 避免出现：
+  - 某些路径写 memory file 但不写 version history
+- 若无法统一，至少在 memory 相关写入处补齐：
+  - 版本生成
+  - 历史链维护
+  - 逻辑删除处理
+
+---
+
+### 9. 检索结果结构与注入链路
+
+**涉及位置：**
+
+- `openviking/retrieve/...`
+- `openviking/session/...`
+- 调用 `search(...)` 后消费结果的代码
+
+**建议改造：**
+
+- 如果检索命中的是历史版本内容，结果结构里最好带上：
+  - `data_version`
+  - `is_historical` 或类似标记
+- 方便上层调试和 observability。
+
+---
+
+### 9.1 历史数据兼容改造
+
+**涉及位置：**
+
+- `openviking/session/memory/utils/memory_file_utils.py`
+- `openviking/session/memory/memory_updater.py`
+- `openviking/storage/viking_fs.py`
+
+**建议改造：**
+
+- 解析 memory file 时允许 `VERSION_HISTORY` 缺失
+- 对缺少 `VERSION_HISTORY` 的旧文件，按单版本 head 文件处理
+- 对旧文件当前版本号的判断采用三段式 fallback：`VERSION_HISTORY.data_version` -> `VERSION_HISTORY.updated_at` -> 版本未知的历史数据文件
+- 对版本未知的历史数据文件，禁止参与带 `data_version` 的历史视图
+- materialize / search 过滤逻辑都要覆盖这种兼容路径
+- 新版首次重写旧文件时，自动写入 `VERSION_HISTORY`
+
+---
+
+### 10. 测试建议
+
+**建议新增测试范围：**
+
+#### 单元测试
+
+- `memory_file_utils`：
+  - 解析 `VERSION_HISTORY`
+  - 生成 reverse diff
+  - 应用 reverse diff
+- `memory_updater`：
+  - create / update / logical delete
+  - 超过 100 个版本后的裁剪
+  - 单文件加锁后的并发安全性
+- `materialize_memory_at_version`：
+  - 命中 head
+  - 命中历史版本
+  - 不存在 `<= data_version` 的版本
+  - 历史版本 `status = "deleted"` 的情况
+
+#### 集成测试
+
+- 写入多次后按版本 read
+- search 命中后按版本 materialize
+- 默认 search 不返回逻辑删除文件
+- 指定 `data_version` 后返回删除前历史内容（若该版本可见）
+
+---
+
+### 11. 建议的最小落地顺序
+
+1. 先补 `memory_file_utils` 的版本历史解析与 diff 能力
+2. 再新增 `memory_version_utils.py`，实现 `materialize_memory_at_version(...)` 等版本工具
+3. 再改 `memory_updater`，让写入真正产生版本链
+4. 再把 `data_version` 接到 `read`
+5. 最后把 `data_version` 接到 `search`
+
+这样风险最可控。
+
+---
+
+## Implementation Checklist
+
+### Phase 1：基础数据结构
+
+- [ ] 在 `memory_file_utils.py` 中支持解析独立的 `VERSION_HISTORY` 注释块
+- [ ] 新增 `memory_version_utils.py`
+- [ ] 定义 `VERSION_HISTORY` 结构：`data_version` / `updated_at` / `status` / `versions`
+- [ ] 明确 `MEMORY_FIELDS` 仅保留业务元数据
+- [ ] 支持缺少 `VERSION_HISTORY` 的历史数据兼容路径
+
+### Phase 2：版本读写能力
+
+- [ ] 接入 `diff-match-patch` 生成 reverse diff
+- [ ] 实现 `materialize_memory_at_version(...)`
+- [ ] 实现 `resolve_version_for_data_version(...)`
+- [ ] 实现 `is_version_visible(...)`
+- [ ] 实现历史版本上限裁剪：最多保留 100 个版本
+
+### Phase 3：写入链路改造
+
+- [ ] 在 batch 开始时统一生成 `data_version`
+- [ ] 在 `memory_updater.py` 中接入版本链写入
+- [ ] create/update/delete 三种写入路径都生成版本记录
+- [ ] delete 改为逻辑删除：写 `VERSION_HISTORY.status = "deleted"`
+- [ ] 写入同一个 memory file 时加单文件排他锁
+
+### Phase 4：读取与检索接入
+
+- [ ] `read` 接口支持 `data_version`
+- [ ] `search` 接口支持 `data_version`
+- [ ] search 结果在返回前做历史版本 materialize
+- [ ] 若不存在 `<= data_version` 的可用版本，则过滤结果
+- [ ] 若目标版本 `status = "deleted"`，则过滤结果
+
+### Phase 5：测试
+
+- [ ] 单元测试：`VERSION_HISTORY` 解析
+- [ ] 单元测试：reverse diff 生成与应用
+- [ ] 单元测试：历史版本 materialize
+- [ ] 单元测试：历史数据兼容路径
+- [ ] 单元测试：版本上限裁剪
+- [ ] 集成测试：按版本 read
+- [ ] 集成测试：按版本 search
+- [ ] 集成测试：逻辑删除后的当前/历史可见性
+
+### Phase 6：后续优化（非一期必需）
+
+- [ ] compact 机制
+- [ ] checkpoint 机制
+- [ ] 更强的历史召回优化
+- [ ] observability / debug 输出增强
+
+
+---
+
+## 开发任务单（细化到文件 / 函数 / 测试）
+
+### Task 1：扩展 memory file 解析格式
+
+**目标：** 支持 `VERSION_HISTORY` 独立注释块，且不破坏现有 `MEMORY_FIELDS` 解析。
+
+**文件：**
+- `openviking/session/memory/utils/messages.py`
+- `openviking/session/memory/utils/memory_file_utils.py`
+- `openviking/session/memory/dataclass.py`
+- `tests/unit/session/memory/test_memory_version_utils.py`（新增）
+
+**建议函数改造：**
+- `parse_memory_file_with_fields(...)`
+  - 保持兼容旧逻辑
+  - 可考虑拆成：
+    - `parse_memory_fields_comment(...)`
+    - `parse_version_history_comment(...)`
+- `MemoryFileUtils.read(...)`
+  - 支持从原始文件中同时解析 `MEMORY_FIELDS` 和 `VERSION_HISTORY`
+- `MemoryFileUtils.write(...)`
+  - 支持写回 `VERSION_HISTORY`
+
+**建议新增测试：**
+- `test_parse_memory_file_without_version_history()`
+- `test_parse_memory_file_with_version_history()`
+- `test_write_memory_file_with_version_history()`
+
+---
+
+### Task 2：新增版本工具模块
+
+**目标：** 提供历史版本 materialize 与可见性判断能力。
+
+**文件：**
+- `openviking/session/memory/utils/memory_version_utils.py`（新增）
+- `tests/unit/session/memory/test_memory_version_utils.py`（新增）
+
+**建议新增函数：**
+- `materialize_memory_at_version(raw_content: str, data_version: int | None) -> str | None`
+- `resolve_version_for_data_version(version_history: dict, data_version: int) -> dict | None`
+- `is_version_visible(version_history: dict) -> bool`
+- `trim_versions(version_history: dict, limit: int = 100) -> dict`
+
+**建议新增测试：**
+- `test_materialize_returns_head_when_data_version_is_none()`
+- `test_materialize_returns_head_when_head_version_lte_target()`
+- `test_materialize_replays_reverse_diffs()`
+- `test_materialize_returns_none_when_no_version_lte_target()`
+- `test_materialize_filters_deleted_version()`
+- `test_trim_versions_keeps_latest_100_versions()`
+
+---
+
+### Task 3：扩展版本数据模型
+
+**目标：** 给 memory file 增加版本历史结构定义。
+
+**文件：**
+- `openviking/session/memory/dataclass.py`
+- `tests/unit/session/memory/test_memory_version_models.py`（新增，可选）
+
+**建议新增模型：**
+- `VersionHistoryItem`
+- `VersionHistory`
+
+**建议模型字段：**
+- `VersionHistory`
+  - `data_version`
+  - `updated_at`
+  - `status`
+  - `versions`
+- `VersionHistoryItem`
+  - `data_version`
+  - `op`
+  - `reverse_diff`
+
+**建议新增测试：**
+- `test_version_history_model_accepts_active_status()`
+- `test_version_history_model_accepts_deleted_status()`
+- `test_version_history_item_create_with_null_reverse_diff()`
+
+---
+
+### Task 4：改造写入链路，生成版本链
+
+**目标：** 在 memory upsert / delete 时生成 reverse diff 并写入 `VERSION_HISTORY`。
+
+**文件：**
+- `openviking/session/memory/memory_updater.py`
+- `openviking/session/compressor_v2.py`
+- `tests/unit/session/memory/test_memory_updater_versioning.py`（新增）
+
+**重点函数：**
+- `MemoryUpdater._apply_upsert(...)`
+- `MemoryUpdater._apply_delete(...)`
+- `compressor_v2` 中发起 memory update batch 的入口
+
+**具体改造点：**
+- 在 batch 开始时生成统一 `data_version`
+- upsert 时：
+  - 读取旧文件
+  - 生成新文件
+  - 计算 `new -> old` reverse diff
+  - 更新 `VERSION_HISTORY.data_version`
+  - 更新 `VERSION_HISTORY.updated_at`
+  - 更新 `VERSION_HISTORY.status = "active"`
+  - 追加新的 version item
+- delete 时：
+  - 不物理删除文件
+  - 仅设置 `VERSION_HISTORY.status = "deleted"`
+  - 追加 delete version item
+- 版本数超过 100 时裁剪最老项
+
+**建议新增测试：**
+- `test_apply_upsert_creates_initial_version_history()`
+- `test_apply_upsert_appends_reverse_diff()`
+- `test_apply_delete_marks_status_deleted()`
+- `test_apply_upsert_trims_old_versions_over_limit()`
+
+---
+
+### Task 5：增加单文件写锁
+
+**目标：** 防止并发写同一个 memory file 时破坏版本链。
+
+**文件：**
+- `openviking/session/memory/memory_updater.py`
+- 可能涉及：`openviking/storage/transaction/*`
+- `tests/unit/session/memory/test_memory_version_locking.py`（新增）
+
+**改造建议：**
+- 在 `_apply_upsert(...)` / `_apply_delete(...)` 外围加单文件级排他锁
+- 锁范围覆盖：
+  - 读旧文件
+  - 生成 diff
+  - 写回正文
+  - 写回 `VERSION_HISTORY`
+
+**建议新增测试：**
+- `test_concurrent_writes_same_file_are_serialized()`
+
+---
+
+### Task 6：read 接口支持 data_version
+
+**目标：** 文件读取时支持按版本视图读取。
+
+**文件：**
+- `openviking/storage/viking_fs.py`
+- `openviking/service/fs_service.py`
+- `openviking/async_client.py`
+- `openviking/sync_client.py`
+- `openviking/client/local.py`
+- `tests/unit/session/memory/test_memory_version_read.py`（新增）
+
+**重点函数：**
+- `VikingFS.read(...)`
+- `VikingFS.read_file(...)`
+- 上层 client / service 的 read 接口
+
+**具体改造点：**
+- 增加 `data_version: Optional[int] = None`
+- 对 memory file 读取：
+  - 若未传 `data_version`，读 head
+  - 若传入 `data_version`，走 `materialize_memory_at_version(...)`
+
+**建议新增测试：**
+- `test_read_returns_head_without_data_version()`
+- `test_read_returns_materialized_content_with_data_version()`
+- `test_read_returns_not_found_for_unknown_historical_file_when_data_version_specified()`
+
+---
+
+### Task 7：search 接口支持 data_version
+
+**目标：** 检索结果在返回前支持历史版本 materialize。
+
+**文件：**
+- `openviking/storage/viking_fs.py`
+- `openviking/server/routers/search.py`
+- `openviking/async_client.py`
+- `openviking/sync_client.py`
+- `tests/unit/session/memory/test_memory_version_search.py`（新增）
+
+**重点函数：**
+- `VikingFS.search(...)`
+- 对外 search router / client
+
+**具体改造点：**
+- 增加 `data_version: Optional[int] = None`
+- 向量召回逻辑不变
+- 在返回结果前增加后处理：
+  - materialize 到目标版本
+  - 若无 `<= data_version` 的可用版本，过滤
+  - 若该版本 `status = "deleted"`，过滤
+
+**建议新增测试：**
+- `test_search_materializes_memory_results_to_target_data_version()`
+- `test_search_filters_result_when_no_version_lte_target()`
+- `test_search_filters_deleted_historical_version()`
+
+---
+
+### Task 8：历史数据兼容路径
+
+**目标：** 兼容缺少 `VERSION_HISTORY` 的旧 memory file。
+
+**文件：**
+- `openviking/session/memory/utils/memory_version_utils.py`
+- `openviking/storage/viking_fs.py`
+- `tests/unit/session/memory/test_memory_version_legacy_compat.py`（新增）
+
+**具体改造点：**
+- 旧文件当前版本判断顺序：
+  1. `VERSION_HISTORY.data_version`
+  2. `VERSION_HISTORY.updated_at`
+  3. 否则视为版本未知的历史数据文件
+- 对版本未知的历史数据文件：
+  - 不传 `data_version` 可返回当前内容
+  - 传 `data_version` 时不参与历史视图
+
+**建议新增测试：**
+- `test_legacy_file_without_version_history_reads_head()`
+- `test_legacy_file_without_version_history_is_filtered_in_historical_view()`
+- `test_legacy_file_uses_updated_at_as_fallback_version()`
+
+---
+
+### Task 9：端到端验证
+
+**目标：** 验证版本化写入、读取、检索链路端到端可用。
+
+**文件：**
+- `tests/integration/test_memory_data_versioning_e2e.py`（新增）
+
+**建议场景：**
+- 同一个 memory file 连续写入 3 次
+- 按不同 `data_version` 读取，验证内容随版本变化
+- 检索命中该 memory file 后，验证返回的是指定版本内容
+- 删除后默认 search 不可见
+- 删除前版本在历史视图中仍可见
+
+---
+
+### 建议实现顺序（执行版）
+
+1. 先做 `messages.py` / `memory_file_utils.py` 的格式解析扩展
+2. 再做 `memory_version_utils.py`
+3. 再补 `dataclass.py` 版本模型
+4. 再改 `memory_updater.py` 写入链路
+5. 再加单文件锁
+6. 再接 `read(data_version=...)`
+7. 最后接 `search(data_version=...)`
+8. 结尾补单测和 e2e

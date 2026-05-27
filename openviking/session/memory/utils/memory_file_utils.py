@@ -11,6 +11,8 @@ from openviking.utils.time_utils import parse_iso_datetime
 # Regex patterns for MEMORY_FIELDS HTML comment
 _MEMORY_FIELDS_PATTERN = re.compile(r"\n\n<!--\s*MEMORY_FIELDS\s*\n(.*?)\n-->", re.DOTALL)
 _MEMORY_FIELDS_PATTERN_END = re.compile(r"<!--\s*MEMORY_FIELDS\s*\n(.*?)\n-->$", re.DOTALL)
+_VERSION_HISTORY_PATTERN = re.compile(r"\n\n<!--\s*VERSION_HISTORY\s*\n(.*?)\n-->", re.DOTALL)
+_VERSION_HISTORY_PATTERN_END = re.compile(r"<!--\s*VERSION_HISTORY\s*\n(.*?)\n-->$", re.DOTALL)
 
 DEFAULT_TRUNCATE_MAX_CHARS = 1000
 
@@ -32,8 +34,23 @@ def _deserialize_datetime(metadata: Dict[str, Any]) -> Dict[str, Any]:
     return result
 
 
+def _deserialize_version_history(
+    version_history: Optional[Dict[str, Any]],
+) -> Optional[Dict[str, Any]]:
+    if not isinstance(version_history, dict):
+        return version_history
+    result = version_history.copy()
+    if "updated_at" in result and isinstance(result["updated_at"], str):
+        try:
+            result["updated_at"] = parse_iso_datetime(result["updated_at"])
+        except (ValueError, TypeError):
+            pass
+    return result
+
+
 def _serialize_with_metadata(
     metadata: Dict[str, Any],
+    version_history: Optional[Dict[str, Any]] = None,
     content_template: str = None,
     extract_context: Any = None,
 ) -> str:
@@ -49,19 +66,30 @@ def _serialize_with_metadata(
 
     clean_metadata = {k: v for k, v in metadata.items() if v is not None}
 
-    if not clean_metadata:
+    blocks = []
+    if clean_metadata:
+        metadata_json = json.dumps(
+            clean_metadata, indent=2, default=_serialize_datetime, ensure_ascii=False
+        )
+        blocks.append(f"<!-- MEMORY_FIELDS\n{metadata_json}\n-->")
+
+    clean_version_history = (
+        {k: v for k, v in version_history.items() if v is not None} if version_history else None
+    )
+    if clean_version_history:
+        version_history_json = json.dumps(
+            clean_version_history, indent=2, default=_serialize_datetime, ensure_ascii=False
+        )
+        blocks.append(f"<!-- VERSION_HISTORY\n{version_history_json}\n-->")
+
+    if not blocks:
         return content
 
-    metadata_json = json.dumps(
-        clean_metadata, indent=2, default=_serialize_datetime, ensure_ascii=False
-    )
-
-    comment = f"\n\n<!-- MEMORY_FIELDS\n{metadata_json}\n-->"
-
+    suffix = "\n\n".join(blocks)
     if not content or not content.strip():
-        return comment.lstrip()
+        return suffix
 
-    return content + comment
+    return content + "\n\n" + suffix
 
 
 class MemoryFileUtils:
@@ -76,6 +104,8 @@ class MemoryFileUtils:
     def read(raw_content: str, uri: Optional[str] = None) -> MemoryFile:
         """Parse a memory file and return a MemoryFile with markdown links preserved."""
         parsed = parse_memory_file_with_fields(raw_content)
+        if "version_history" in parsed:
+            parsed["version_history"] = _deserialize_version_history(parsed["version_history"])
         parsed = _deserialize_datetime(parsed)
         return MemoryFile.from_parsed(uri=uri, parsed=parsed)
 
@@ -87,8 +117,10 @@ class MemoryFileUtils:
     ) -> str:
         """Serialize a MemoryFile as plain-text body plus MEMORY_FIELDS metadata."""
         metadata = memory_file.to_metadata()
+        version_history = memory_file.to_version_history_metadata()
         return _serialize_with_metadata(
             metadata,
+            version_history=version_history,
             content_template=content_template,
             extract_context=extract_context,
         )

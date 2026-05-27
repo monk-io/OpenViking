@@ -72,6 +72,7 @@ class StrPatch(BaseModel):
     - Each block MUST have both "search" and "replace" fields
     - ✅ Correct: {"blocks": [{"search": "old text", "replace": "new text"}]}
     - ❌ Wrong: {"blocks": ["just a string"]} or {"blocks": [{"search": "old"}]} (missing replace)
+    - ❌ Wrong: "SEARCH: old text\nREPLACE: new text"
     """
 
     blocks: List[SearchReplaceBlock] = Field(

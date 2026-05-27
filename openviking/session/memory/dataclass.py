@@ -200,6 +200,25 @@ class MemoryData(BaseModel):
         self.fields[field_name] = value
 
 
+class VersionHistoryItem(BaseModel):
+    """Single reverse-diff version item stored in VERSION_HISTORY."""
+
+    data_version: Optional[int] = Field(None, description="Global data version for this item")
+    op: str = Field("", description="Operation type: create/update/delete")
+    reverse_diff: Optional[str] = Field(None, description="Reverse diff from current to previous")
+
+
+class VersionHistory(BaseModel):
+    """System version metadata stored alongside a memory file."""
+
+    data_version: Optional[int] = Field(
+        None, description="Current head data version of the memory file"
+    )
+    updated_at: Optional[datetime] = Field(None, description="Last write timestamp")
+    status: str = Field("active", description="Current status: active/deleted")
+    versions: List[VersionHistoryItem] = Field(default_factory=list, description="Version items")
+
+
 class MemoryFile(BaseModel):
     """Typed representation of a memory file's parsed content."""
 
@@ -209,6 +228,7 @@ class MemoryFile(BaseModel):
     backlinks: List[Dict[str, Any]] = []
     memory_type: Optional[str] = None
     extra_fields: Dict[str, Any] = {}
+    version_history: Optional[VersionHistory] = None
 
     def plain_content(self) -> str:
         from openviking.session.memory.utils.link_renderer import LinkRenderer
@@ -224,6 +244,9 @@ class MemoryFile(BaseModel):
         links = parsed.pop("links", []) or []
         backlinks = parsed.pop("backlinks", []) or []
         memory_type = parsed.pop("memory_type", None)
+        version_history = parsed.pop("version_history", None)
+        if isinstance(version_history, dict):
+            version_history = VersionHistory.model_validate(version_history)
         # Remaining keys are dynamic schema fields + system fields
         return cls(
             uri=uri,
@@ -232,6 +255,7 @@ class MemoryFile(BaseModel):
             backlinks=backlinks,
             memory_type=memory_type,
             extra_fields=parsed,
+            version_history=version_history,
         )
 
     def to_metadata(self) -> Dict[str, Any]:
@@ -245,6 +269,12 @@ class MemoryFile(BaseModel):
         if self.memory_type:
             metadata["memory_type"] = self.memory_type
         return metadata
+
+    def to_version_history_metadata(self) -> Optional[Dict[str, Any]]:
+        """Return VERSION_HISTORY payload suitable for serialization."""
+        if not self.version_history:
+            return None
+        return self.version_history.model_dump(exclude_none=True)
 
 
 class ResolvedOperation(BaseModel):
