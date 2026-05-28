@@ -913,11 +913,7 @@ class SessionCompressorV2:
                     inherited = [
                         link.get("to_uri", "")
                         for link in old_mf.links
-                        if (
-                            link.get("link_type") == "derived_from"
-                            and link.get("to_uri", "")
-                            and "/memories/trajectories/" in link.get("to_uri", "")
-                        )
+                        if link.get("link_type") == "derived_from" and link.get("to_uri", "")
                     ]
                     if inherited:
                         inheritance_map[new_uri] = inherited
