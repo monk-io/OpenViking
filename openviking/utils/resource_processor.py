@@ -147,6 +147,9 @@ class ResourceProcessor:
                 # Use reason as instruction fallback so it influences L0/L1
                 # generation and improves search relevance as documented.
                 effective_instruction = instruction or reason
+                agent_id = getattr(getattr(ctx, "user", None), "agent_id", "")
+                if agent_id:
+                    kwargs.setdefault("agent_id", agent_id)
                 with viking_fs.bind_request_context(ctx):
                     parse_result = await media_processor.process(
                         source=path,

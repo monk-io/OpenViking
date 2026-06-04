@@ -5,7 +5,7 @@ import logging
 import os
 from pathlib import Path
 from threading import Lock
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 from pydantic import BaseModel, Field, ValidationError, model_validator
 
@@ -48,6 +48,39 @@ from .vlm_config import VLMConfig
 def _get_config_warning_logger():
     """Use stdlib logging during config bootstrap to avoid early logger side effects."""
     return logging.getLogger(__name__)
+
+
+class ParserApiConfig(BaseModel):
+    """Configuration for the knowledge_base_server parse_doc API."""
+
+    account_id: str = ""
+    enable: bool = False
+    extensions: List[str] = Field(default_factory=list)
+    host: str = ""
+    env: str = ""
+
+    model_config = {"extra": "forbid"}
+
+    @model_validator(mode="after")
+    def _normalize_and_validate(self) -> "ParserApiConfig":
+        normalized_extensions: List[str] = []
+        for ext in self.extensions or []:
+            s = str(ext).strip().lower()
+            if not s:
+                continue
+            if s.startswith("."):
+                s = s[1:]
+            normalized_extensions.append(s)
+        self.extensions = normalized_extensions
+
+        if self.enable:
+            if not self.account_id.strip():
+                raise ValueError("parser_api.account_id is required when parser_api.enable=true")
+            if not self.host.strip():
+                raise ValueError("parser_api.host is required when parser_api.enable=true")
+        if self.host and "://" not in self.host:
+            raise ValueError("parser_api.host must include scheme (e.g., https://...)")
+        return self
 
 
 class OpenVikingConfig(BaseModel):
@@ -126,6 +159,11 @@ class OpenVikingConfig(BaseModel):
     semantic: SemanticConfig = Field(
         default_factory=SemanticConfig,
         description="Semantic processing configuration (overview/abstract limits)",
+    )
+
+    parser_api: ParserApiConfig = Field(
+        default_factory=ParserApiConfig,
+        description="Third-party parser API configuration (parse_doc/submit, parse_doc/get_task_info)",
     )
 
     auto_generate_l0: bool = Field(

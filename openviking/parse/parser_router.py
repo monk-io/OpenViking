@@ -3,9 +3,8 @@
 """
 ParserRouter: Route parsing requests between ParserRegistry and KnowledgeParser.
 
-Routing is controlled by environment variables.
+Routing is controlled by ov.conf (OpenVikingConfig.parser_api).
 """
-import os
 from pathlib import Path
 from typing import TYPE_CHECKING, Union
 
@@ -37,18 +36,20 @@ class ParserRouter:
     def should_use_knowledge_parser(self, source_path: Union[str, Path]) -> bool:
         """
         Decide whether to use KnowledgeParser.
-
-        Env example:
-        - KNOWLEDGE_PARSER_ENABLED=true
-        - KNOWLEDGE_PARSER_EXTENSIONS=pdf,docx,pptx,mp4,mp3
         """
-        enabled = os.environ.get("KNOWLEDGE_PARSER_ENABLED", "false").lower() == "true"
-        if not enabled:
+        try:
+            from openviking_cli.utils.config.open_viking_config import get_openviking_config
+
+            ov_config = get_openviking_config()
+        except Exception:
+            return False
+
+        parser_api = getattr(ov_config, "parser_api", None)
+        if not parser_api or not getattr(parser_api, "enable", False):
             return False
 
         ext = Path(source_path).suffix.lower().lstrip(".")
-        extensions_str = os.environ.get("KNOWLEDGE_PARSER_EXTENSIONS", "pdf,docx,pptx,mp4,mp3")
-        extensions = [e.strip().lower() for e in extensions_str.split(",") if e.strip()]
+        extensions = getattr(parser_api, "extensions", None) or []
         return ext in extensions
 
     async def parse(self, source: Union[str, Path, "LocalResource"], **kwargs) -> ParseResult:
@@ -62,7 +63,7 @@ class ParserRouter:
             return await self._get_knowledge_parser().parse(str(source_path), **kwargs)
         else:
             logger.info(f"[ParserRouter] Using internal ParserRegistry for {source_path}")
-            return await self._parser_registry.parse(source, **kwargs)
+            return await self._parser_registry.parse(source_path, **kwargs)
 
     def _extract_source_path(self, source: Union[str, Path, "LocalResource"]) -> Union[str, Path]:
         """Extract a filesystem path from the source."""

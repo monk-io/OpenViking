@@ -10,7 +10,7 @@ Workflow:
 4. Materialize the result into VikingFS temp directory
 5. Return ParseResult for downstream TreeBuilder/SemanticQueue processing
 """
-import os
+import hashlib
 import json
 import asyncio
 import mimetypes
@@ -21,9 +21,6 @@ from urllib.parse import urlparse
 from typing import Any, Dict, List, Optional, Union
 
 import httpx
-from volcengine.auth.SignerV4 import SignerV4
-from volcengine.base.Request import Request
-from volcengine.Credentials import Credentials
 
 from openviking.parse.base import ParseResult, ResourceNode, NodeType
 from openviking.parse.parsers.base_parser import BaseParser
@@ -39,29 +36,24 @@ class KnowledgeParser(BaseParser):
     """
 
     def __init__(self):
-        self._api_host = os.environ.get(
-            "KNOWLEDGE_PARSER_HOST",
-            "http://localhost:8089",
-        ).rstrip("/")
-        self._upload_host = os.environ.get("KNOWLEDGE_PARSER_UPLOAD_HOST", self._api_host).rstrip("/")
-        self._http_timeout_sec = float(os.environ.get("KNOWLEDGE_PARSER_HTTP_TIMEOUT_SEC", "10"))
-        self._timeout_sec = int(os.environ.get("KNOWLEDGE_PARSER_TIMEOUT_SEC", "1800"))
-        self._default_poll_interval_ms = int(
-            os.environ.get("KNOWLEDGE_PARSER_POLL_INTERVAL_MS", "3000")
-        )
-        self._account_id = os.environ.get("KNOWLEDGE_PARSER_ACCOUNT_ID")
-        self._kb_env = os.environ.get("KNOWLEDGE_PARSER_KB_ENV")
-        self._ak = os.environ.get("KNOWLEDGE_PARSER_AK")
-        self._sk = os.environ.get("KNOWLEDGE_PARSER_SK")
-        self._service = os.environ.get("KNOWLEDGE_PARSER_SERVICE", "air")
-        self._region = os.environ.get("KNOWLEDGE_PARSER_REGION", "cn-north-1")
-        self._session_token = os.environ.get("KNOWLEDGE_PARSER_SESSION_TOKEN") or ""
-        self._upload_simple_max_bytes = int(
-            os.environ.get("KNOWLEDGE_PARSER_UPLOAD_SIMPLE_MAX_BYTES", str(100 * 1024 * 1024))
-        )
-        self._upload_part_size_bytes = int(
-            os.environ.get("KNOWLEDGE_PARSER_UPLOAD_PART_SIZE_BYTES", str(8 * 1024 * 1024))
-        )
+        from openviking_cli.utils.config.open_viking_config import get_openviking_config
+
+        ov_config = get_openviking_config()
+        parser_api = ov_config.parser_api
+        self._api_host = (parser_api.host or "").rstrip("/")
+        self._account_id = parser_api.account_id
+        self._kb_env = parser_api.env or None
+
+        self._http_timeout_sec = 10.0
+        self._timeout_sec = 1800
+        self._default_poll_interval_ms = 3000
+        self._upload_simple_max_bytes = 100 * 1024 * 1024
+        self._upload_part_size_bytes = 8 * 1024 * 1024
+
+        if not self._api_host:
+            raise ValueError("parser_api.host is required for KnowledgeParser")
+        if not self._account_id:
+            raise ValueError("parser_api.account_id is required for KnowledgeParser")
 
         self._video_exts = {"mp4", "mov", "avi", "flv", "mkv", "wmv", "webm"}
         self._audio_exts = {"mp3", "wav", "m4a", "flac", "aac", "ogg"}
@@ -98,13 +90,6 @@ class KnowledgeParser(BaseParser):
             doc_name = local_path.stem or "resource"
             doc_type = local_path.suffix.lower().lstrip(".") or "unknown"
 
-        account_id = kwargs.get("account_id") or self._account_id
-        if not account_id:
-            raise ValueError(
-                "KnowledgeParser requires request header V-Account-Id. "
-                "Set env KNOWLEDGE_PARSER_ACCOUNT_ID or pass account_id in add_resource()."
-            )
-
         if url is None and local_path is not None:
             if doc_type not in (self._video_exts | self._audio_exts):
                 raise ValueError(
@@ -113,21 +98,42 @@ class KnowledgeParser(BaseParser):
                 )
             url, upload_meta = await self._upload_local_file(
                 file_path=local_path,
-                account_id=str(account_id),
+                account_id=self._account_id,
             )
         else:
             upload_meta = {}
+
+        agent_id = kwargs.get("agent_id")
+        sub_path = agent_id if isinstance(agent_id, str) and agent_id.strip() else None
+
+        temp_file_id = kwargs.get("temp_file_id")
+        file_id_seed = (
+            temp_file_id
+            if isinstance(temp_file_id, str) and temp_file_id.strip()
+            else (url or "")
+        )
+        if not file_id_seed:
+            raise ValueError("file_id seed is empty for KnowledgeParser")
+        file_id = hashlib.sha256(file_id_seed.encode("utf-8")).hexdigest()[:32]
 
         logger.info(f"[KnowledgeParser] submit: url={url} doc_type={doc_type}")
         task_info = await self._submit_task(
             url=url,
             doc_type=doc_type,
             doc_name=doc_name,
-            account_id=str(account_id),
+            account_id=self._account_id,
+            file_id=file_id,
+            sub_path=sub_path,
         )
         task_id = task_info["task_id"]
         poll_ms = int(task_info.get("next_poll_after_ms") or self._default_poll_interval_ms)
-        data = await self._wait_done(task_id=task_id, poll_interval_ms=poll_ms, account_id=str(account_id))
+        data = await self._wait_done(
+            task_id=task_id,
+            poll_interval_ms=poll_ms,
+            account_id=self._account_id,
+            file_id=file_id,
+            sub_path=sub_path,
+        )
         result_obj = (data.get("result") or {}) if isinstance(data, dict) else {}
         zip_url = result_obj.get("zip_url")
         task_meta = {
@@ -196,60 +202,15 @@ class KnowledgeParser(BaseParser):
     def _json_bytes(self, obj: Any) -> bytes:
         return json.dumps(obj, ensure_ascii=False).encode("utf-8")
 
-    def _maybe_sign_headers(
+    async def _submit_task(
         self,
         *,
-        method: str,
         url: str,
-        headers: Dict[str, str],
-        params: Optional[Dict[str, Any]],
-        body: Optional[Union[str, bytes]],
-    ) -> Dict[str, str]:
-        if not (self._ak and self._sk):
-            return headers
-
-        parsed = urlparse(url)
-        host = parsed.netloc
-        scheme = parsed.scheme or "https"
-        path = parsed.path or "/"
-
-        r = Request()
-        r.set_shema(scheme)
-        r.set_method(method.upper())
-        r.set_connection_timeout(max(1, int(self._http_timeout_sec)))
-        r.set_socket_timeout(max(1, int(self._http_timeout_sec)))
-
-        signed_headers = dict(headers)
-        signed_headers.setdefault("Host", host)
-        signed_headers.setdefault("Accept", "application/json")
-        r.set_headers(signed_headers)
-        if params:
-            normalized_params: Dict[str, Any] = {}
-            for k, v in params.items():
-                if isinstance(v, (int, float, bool)):
-                    normalized_params[k] = str(v)
-                elif isinstance(v, list):
-                    normalized_params[k] = ",".join([str(x) for x in v])
-                else:
-                    normalized_params[k] = v
-            r.set_query(normalized_params)
-        r.set_host(host)
-        r.set_path(path)
-        if body is not None:
-            r.set_body(body)
-
-        credentials = Credentials(
-            self._ak,
-            self._sk,
-            self._service,
-            self._region,
-            session_token=self._session_token,
-        )
-        SignerV4.sign(r, credentials)
-        return dict(r.headers)
-
-    async def _submit_task(
-        self, url: str, doc_type: str, doc_name: str, account_id: str
+        doc_type: str,
+        doc_name: str,
+        account_id: str,
+        file_id: str,
+        sub_path: Optional[str],
     ) -> Dict[str, Any]:
         submit_url = f"{self._api_host}/api/knowledge/task/parse_doc/submit"
         headers = {"Content-Type": "application/json;charset=UTF-8"}
@@ -257,20 +218,16 @@ class KnowledgeParser(BaseParser):
             "url": url,
             "doc_type": doc_type,
             "doc_name": doc_name,
+            "account_id": account_id,
+            "file_id": file_id,
         }
-        payload["account_id"] = account_id
         headers["V-Account-Id"] = str(account_id)
+        if sub_path:
+            payload["sub_path"] = sub_path
         if self._kb_env:
             headers["x-kb-env"] = self._kb_env
 
         body = self._json_bytes(payload)
-        headers = self._maybe_sign_headers(
-            method="POST",
-            url=submit_url,
-            headers=headers,
-            params=None,
-            body=body,
-        )
         async with httpx.AsyncClient(timeout=self._http_timeout_sec, follow_redirects=True) as client:
             rsp = await client.post(submit_url, content=body, headers=headers)
         rsp.raise_for_status()
@@ -282,7 +239,15 @@ class KnowledgeParser(BaseParser):
             raise RuntimeError(f"submit missing task_id: {body}")
         return data
 
-    async def _wait_done(self, task_id: str, poll_interval_ms: int, account_id: str) -> Dict[str, Any]:
+    async def _wait_done(
+        self,
+        *,
+        task_id: str,
+        poll_interval_ms: int,
+        account_id: str,
+        file_id: str,
+        sub_path: Optional[str],
+    ) -> Dict[str, Any]:
         info_url = f"{self._api_host}/api/knowledge/task/parse_doc/get_task_info"
         headers = {"Content-Type": "application/json;charset=UTF-8"}
         deadline = asyncio.get_running_loop().time() + float(self._timeout_sec)
@@ -296,15 +261,15 @@ class KnowledgeParser(BaseParser):
                 if asyncio.get_running_loop().time() > deadline:
                     raise TimeoutError(f"knowledge parser timeout: task_id={task_id} last_status={last_status}")
 
-                req_body = self._json_bytes({"task_id": task_id})
-                req_headers = self._maybe_sign_headers(
-                    method="POST",
-                    url=info_url,
-                    headers=dict(headers),
-                    params=None,
-                    body=req_body,
-                )
-                rsp = await client.post(info_url, content=req_body, headers=req_headers)
+                payload: Dict[str, Any] = {
+                    "task_id": task_id,
+                    "account_id": account_id,
+                    "file_id": file_id,
+                }
+                if sub_path:
+                    payload["sub_path"] = sub_path
+                req_body = self._json_bytes(payload)
+                rsp = await client.post(info_url, content=req_body, headers=headers)
                 rsp.raise_for_status()
                 body = rsp.json()
                 if body.get("code") != 0:
@@ -417,7 +382,7 @@ class KnowledgeParser(BaseParser):
     async def _post_base_server(
         self,
         path: str,
-        account_id: str,
+        account_id: Optional[str] = None,
         *,
         params: Optional[Dict[str, Any]] = None,
         json: Optional[Dict[str, Any]] = None,
@@ -425,9 +390,10 @@ class KnowledgeParser(BaseParser):
         headers: Optional[Dict[str, str]] = None,
         timeout_sec: float = 600.0,
     ) -> Dict[str, Any]:
-        url = f"{self._upload_host}{path}"
+        url = f"{self._api_host}{path}"
         req_headers = dict(headers or {})
-        req_headers.setdefault("V-Account-Id", str(account_id))
+        if account_id:
+            req_headers.setdefault("V-Account-Id", str(account_id))
         if self._kb_env:
             req_headers.setdefault("x-kb-env", self._kb_env)
 
@@ -437,14 +403,6 @@ class KnowledgeParser(BaseParser):
             body = self._json_bytes(json)
         elif content is not None:
             body = content
-
-        req_headers = self._maybe_sign_headers(
-            method="POST",
-            url=url,
-            headers=req_headers,
-            params=params,
-            body=body,
-        )
         async with httpx.AsyncClient(timeout=timeout_sec, follow_redirects=True) as client:
             rsp = await client.post(url, params=params, content=body, headers=req_headers)
         rsp.raise_for_status()
@@ -456,7 +414,9 @@ class KnowledgeParser(BaseParser):
             raise RuntimeError(f"base_server invalid response: {body}")
         return data
 
-    async def _upload_local_file(self, file_path: Path, account_id: str) -> tuple[str, Dict[str, Any]]:
+    async def _upload_local_file(
+        self, file_path: Path, account_id: Optional[str]
+    ) -> tuple[str, Dict[str, Any]]:
         file_size = file_path.stat().st_size
         content_type = mimetypes.guess_type(str(file_path))[0] or "application/octet-stream"
         if file_size <= self._upload_simple_max_bytes:
@@ -481,11 +441,12 @@ class KnowledgeParser(BaseParser):
             "expires_at": data.get("expires_at"),
             "content_type": content_type,
             "upload_method": "simple" if file_size <= self._upload_simple_max_bytes else "multipart",
-            "upload_host": self._upload_host,
         }
         return presigned_url, meta
 
-    async def _simple_upload(self, file_path: Path, account_id: str, content_type: str) -> Dict[str, Any]:
+    async def _simple_upload(
+        self, file_path: Path, account_id: Optional[str], content_type: str
+    ) -> Dict[str, Any]:
         headers = {"Content-Type": "application/octet-stream"}
         with open(file_path, "rb") as f:
             content = f.read()
@@ -498,7 +459,9 @@ class KnowledgeParser(BaseParser):
                 timeout_sec=1200.0,
             )
 
-    async def _multipart_upload(self, file_path: Path, account_id: str, content_type: str) -> Dict[str, Any]:
+    async def _multipart_upload(
+        self, file_path: Path, account_id: Optional[str], content_type: str
+    ) -> Dict[str, Any]:
         min_part_size = 5 * 1024 * 1024
         part_size = max(self._upload_part_size_bytes, min_part_size)
         init_data = await self._post_base_server(
