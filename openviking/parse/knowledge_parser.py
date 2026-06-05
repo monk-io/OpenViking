@@ -6,7 +6,7 @@ KnowledgeParser: Integrate with a third-party knowledge_base_server for parsing.
 Workflow:
 1. Submit a parse task (submit)
 2. Poll task status (get_task_info) until success/failed
-3. Download result (zip_url or chunks)
+3. Download result (zip_url)
 4. Materialize the result into VikingFS temp directory
 5. Return ParseResult for downstream TreeBuilder/SemanticQueue processing
 """
@@ -116,7 +116,6 @@ class KnowledgeParser(BaseParser):
             raise ValueError("file_id seed is empty for KnowledgeParser")
         file_id = hashlib.sha256(file_id_seed.encode("utf-8")).hexdigest()[:32]
 
-        logger.info(f"[KnowledgeParser] submit: url={url} doc_type={doc_type}")
         task_info = await self._submit_task(
             url=url,
             doc_type=doc_type,
@@ -138,31 +137,26 @@ class KnowledgeParser(BaseParser):
         zip_url = result_obj.get("zip_url")
         task_meta = {
             "task_id": task_id,
-            "api_host": self._api_host,
             "zip_object_key": result_obj.get("zip_object_key"),
             "cost_ms": result_obj.get("cost_ms"),
         }
         if upload_meta:
             task_meta["upload"] = upload_meta
 
-        if zip_url:
-            zip_path = await self._download_zip(zip_url)
-            try:
-                temp_dir_path = await self._unpack_zip_to_temp_dir(
-                    zip_path=zip_path,
-                    resource_name=doc_name,
-                )
-            finally:
-                try:
-                    zip_path.unlink()
-                except Exception:
-                    pass
-        else:
-            chunks = result_obj.get("chunks") or []
-            temp_dir_path = await self._write_chunks_to_temp_dir(
-                chunks=chunks,
+        if not zip_url:
+            raise RuntimeError("knowledge parser result missing zip_url")
+
+        zip_path = await self._download_zip(zip_url)
+        try:
+            temp_dir_path = await self._unpack_zip_to_temp_dir(
+                zip_path=zip_path,
                 resource_name=doc_name,
             )
+        finally:
+            try:
+                zip_path.unlink()
+            except Exception:
+                pass
 
         content_type = "video" if doc_type in self._video_exts else "audio" if doc_type in self._audio_exts else "text"
         root_node = ResourceNode(
@@ -188,7 +182,7 @@ class KnowledgeParser(BaseParser):
             meta=task_meta,
         )
 
-        logger.info(f"[KnowledgeParser] done: source={result.source_path} -> {result.temp_dir_path}")
+        logger.info(f"[KnowledgeParser] done source={result.temp_dir_path}")
         return result
 
     async def parse_content(
@@ -292,7 +286,6 @@ class KnowledgeParser(BaseParser):
                 await asyncio.sleep(max(poll_interval_ms, 200) / 1000.0)
 
     async def _download_zip(self, zip_url: str) -> Path:
-        logger.info(f"[KnowledgeParser] download zip: {zip_url}")
         async with httpx.AsyncClient(timeout=60.0, follow_redirects=True) as client:
             rsp = await client.get(zip_url)
         rsp.raise_for_status()
@@ -327,36 +320,6 @@ class KnowledgeParser(BaseParser):
                     await self._copy_dir_to_fs(child, sub_uri)
                 else:
                     await viking_fs.write_file_bytes(f"{temp_doc_uri}/{child.name}", child.read_bytes())
-
-        return temp_uri
-
-    async def _write_chunks_to_temp_dir(
-        self, chunks: Union[List[Dict[str, Any]], List[str], Any], resource_name: str
-    ) -> str:
-        viking_fs = get_viking_fs()
-        temp_uri = viking_fs.create_temp_uri()
-        await viking_fs.mkdir(temp_uri)
-
-        temp_doc_uri = f"{temp_uri}/{resource_name}"
-        await viking_fs.mkdir(temp_doc_uri)
-
-        texts = []
-        if isinstance(chunks, list):
-            for c in chunks:
-                if isinstance(c, dict):
-                    t = c.get("text") or ""
-                else:
-                    t = str(c)
-                if t:
-                    texts.append(t)
-
-        content = "\n\n---\n\n".join(texts) if texts else ""
-        await viking_fs.write_file_bytes(f"{temp_doc_uri}/content.md", content.encode("utf-8"))
-
-        abstract = content[:200] if content else ""
-        overview = content[:2000] if content else ""
-        await viking_fs.write_file_bytes(f"{temp_doc_uri}/.abstract.md", abstract.encode("utf-8"))
-        await viking_fs.write_file_bytes(f"{temp_doc_uri}/.overview.md", overview.encode("utf-8"))
 
         return temp_uri
 
@@ -436,7 +399,6 @@ class KnowledgeParser(BaseParser):
             raise RuntimeError(f"upload missing presigned_url: {data}")
         meta = {
             "object_key": data.get("object_key"),
-            "presigned_url": presigned_url,
             "size": data.get("size", file_size),
             "expires_at": data.get("expires_at"),
             "content_type": content_type,
