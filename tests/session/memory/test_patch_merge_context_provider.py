@@ -9,24 +9,42 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from openviking.session.memory.dataclass import MemoryTypeSchema
+from openviking.session.memory.dataclass import MemoryFile, MemoryTypeSchema
 from openviking.session.memory.patch_merge_context_provider import (
     PatchMergeContextProvider,
     PatchMergePatch,
 )
 
 
+def _memory_file(
+    *,
+    name: str,
+    uri: str | None,
+    content: str,
+    memory_type: str = "experiences",
+) -> MemoryFile:
+    return MemoryFile(
+        uri=uri,
+        content=content,
+        memory_type=memory_type,
+        extra_fields={
+            "memory_type": memory_type,
+            "experience_name": name,
+            "status": "production",
+        },
+    )
+
+
 @pytest.mark.asyncio
 async def test_patch_merge_context_provider_prefetch_reads_originals_and_renders_patch():
+    uri = "viking://user/u/memories/experiences/booking.md"
     provider = PatchMergeContextProvider(
         memory_type="experiences",
-        original_file_uris=["viking://user/u/memories/experiences/booking.md"],
+        required_file_uris=[uri],
         patches=[
             PatchMergePatch(
-                target_name="booking",
-                target_uri="viking://user/u/memories/experiences/booking.md",
-                before_content="old line\nkeep line",
-                after_content="new line\nkeep line",
+                before_file=_memory_file(name="booking", uri=uri, content="old line\nkeep line"),
+                after_file=_memory_file(name="booking", uri=uri, content="new line\nkeep line"),
             )
         ],
     )
@@ -47,12 +65,16 @@ async def test_patch_merge_context_provider_prefetch_reads_originals_and_renders
     assert read_message["args"] == {"uri": "viking://user/u/memories/experiences/booking.md"}
     assert read_message["result"]["experience_name"] == "booking"
     assert messages[1]["role"] == "user"
-    assert messages[1]["content"].startswith("```diff")
-    assert "diff --git a/viking://user/u/memories/experiences/booking.md" in messages[1]["content"]
-    assert "--- a/viking://user/u/memories/experiences/booking.md" in messages[1]["content"]
-    assert "+++ b/viking://user/u/memories/experiences/booking.md" in messages[1]["content"]
+    assert messages[1]["content"].startswith("# Memory File Patches")
+    assert "## Memory Patch 1" in messages[1]["content"]
+    assert "target_uri: viking://user/u/memories/experiences/booking.md" in messages[1]["content"]
+    assert "### Field Diff: content" in messages[1]["content"]
+    assert "--- content.before" in messages[1]["content"]
+    assert "+++ content.after" in messages[1]["content"]
     assert "-old line" in messages[1]["content"]
     assert "+new line" in messages[1]["content"]
+    assert " keep line" not in messages[1]["content"]
+    assert "### Field Diff: status" not in messages[1]["content"]
 
 
 @pytest.mark.asyncio
@@ -69,10 +91,12 @@ async def test_patch_merge_context_provider_prefetch_searches_and_reads_extra_ca
         required_file_uris=["viking://user/u/memories/experiences/book.md"],
         patches=[
             PatchMergePatch(
-                target_name="books",
-                target_uri="viking://user/u/memories/experiences/books.md",
-                before_content=None,
-                after_content="用户喜欢阅读科幻书籍，尤其是太空歌剧。",
+                before_file=None,
+                after_file=_memory_file(
+                    name="books",
+                    uri="viking://user/u/memories/experiences/books.md",
+                    content="用户喜欢阅读科幻书籍，尤其是太空歌剧。",
+                ),
             )
         ],
     )
@@ -107,20 +131,18 @@ async def test_patch_merge_context_provider_prefetch_searches_and_reads_extra_ca
     assert "viking://user/u/memories/experiences/candidate_0.md" in read_uris
     assert "viking://user/u/memories/experiences/candidate_4.md" in read_uris
     assert "viking://user/u/memories/experiences/candidate_5.md" not in read_uris
-    assert messages[-1]["content"].startswith("```diff")
+    assert messages[-1]["content"].startswith("# Memory File Patches")
 
 
 @pytest.mark.asyncio
 async def test_patch_merge_context_provider_renders_create_patch_from_dev_null():
     provider = PatchMergeContextProvider(
         memory_type="experiences",
-        original_file_uris=[],
+        required_file_uris=[],
         patches=[
             PatchMergePatch(
-                target_name="new_booking",
-                target_uri=None,
-                before_content=None,
-                after_content="created line",
+                before_file=None,
+                after_file=_memory_file(name="new_booking", uri=None, content="created line"),
             )
         ],
     )
@@ -128,9 +150,10 @@ async def test_patch_merge_context_provider_renders_create_patch_from_dev_null()
     messages = await provider.prefetch()
 
     assert len(messages) == 1
-    assert "diff --git /dev/null b/new_booking" in messages[0]["content"]
-    assert "--- /dev/null" in messages[0]["content"]
-    assert "+++ b/new_booking" in messages[0]["content"]
+    assert "target_name: new_booking" in messages[0]["content"]
+    assert "### Field Diff: content" in messages[0]["content"]
+    assert "--- content.before" in messages[0]["content"]
+    assert "+++ content.after" in messages[0]["content"]
     assert "+created line" in messages[0]["content"]
 
 
@@ -144,7 +167,7 @@ def test_patch_merge_context_provider_get_memory_schema_single_type(monkeypatch)
     )
     provider = PatchMergeContextProvider(
         memory_type="experiences",
-        original_file_uris=[],
+        required_file_uris=[],
         patches=[],
     )
     provider._registry = SimpleNamespace(get=lambda name: schema if name == "experiences" else None)
@@ -155,7 +178,7 @@ def test_patch_merge_context_provider_get_memory_schema_single_type(monkeypatch)
 def test_patch_merge_context_provider_get_memory_schema_raises_for_missing_type():
     provider = PatchMergeContextProvider(
         memory_type="missing",
-        original_file_uris=[],
+        required_file_uris=[],
         patches=[],
     )
     provider._registry = SimpleNamespace(get=lambda name: None)

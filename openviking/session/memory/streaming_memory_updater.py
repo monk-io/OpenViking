@@ -10,6 +10,7 @@ PatchMergeContextProvider, then applies the merged operations with MemoryUpdater
 
 from __future__ import annotations
 
+import asyncio
 import threading
 from dataclasses import dataclass, field
 from typing import Any, Hashable
@@ -107,6 +108,7 @@ class StreamingMemoryUpdater:
     _batcher: StreamingBatcher[MemoryUpdateRequest, StreamingMemoryUpdateResult] = field(
         init=False, repr=False
     )
+    _apply_lock: asyncio.Lock = field(init=False, repr=False)
     _last_result: StreamingMemoryUpdateResult | None = field(init=False, default=None, repr=False)
     _closed: bool = field(init=False, default=False, repr=False)
 
@@ -123,6 +125,7 @@ class StreamingMemoryUpdater:
             item_size=lambda request: _operation_count(request.operations),
             result_metadata=lambda result: result.metadata,
         )
+        self._apply_lock = asyncio.Lock()
         self._last_result = None
         self._closed = False
 
@@ -157,7 +160,18 @@ class StreamingMemoryUpdater:
             raise RuntimeError("StreamingMemoryUpdater is closed")
         if request.ctx is None:
             raise ValueError("MemoryUpdateRequest.ctx is required")
-        result = await self._batcher.submit(request)
+        append_only_request, merge_request = self._split_append_only_request(request)
+        append_result = (
+            await self._apply_append_only_request_now(append_only_request)
+            if append_only_request is not None
+            else None
+        )
+        merge_result = await self._batcher.submit(merge_request) if merge_request is not None else None
+        result = combine_streaming_memory_results(
+            append_result,
+            merge_result,
+            fallback_request_count=1,
+        )
         self._last_result = result
         tracer.info(
             "StreamingMemoryUpdater submit finished "
@@ -170,6 +184,93 @@ class StreamingMemoryUpdater:
             f"edited_uris={result.apply_result.edited_uris} "
             f"deleted_uris={result.apply_result.deleted_uris} "
             f"errors={result.apply_result.errors}",
+            console=self.config.trace_console,
+        )
+        return result
+
+    def _split_append_only_request(
+        self, request: MemoryUpdateRequest
+    ) -> tuple[MemoryUpdateRequest | None, MemoryUpdateRequest | None]:
+        operations = request.operations
+        registry = self.registry or create_default_registry()
+        append_ops: list[ResolvedOperation] = []
+        merge_ops: list[ResolvedOperation] = []
+        for op in list(operations.upsert_operations or []):
+            schema = registry.get(op.memory_type)
+            if op.uris and getattr(schema, "operation_mode", None) == "add_only":
+                append_ops.append(op)
+            else:
+                merge_ops.append(op)
+
+        append_links, merge_links = split_links_for_append_only_ops(
+            list(getattr(operations, "resolved_links", []) or []),
+            append_ops=append_ops,
+            merge_ops=merge_ops,
+        )
+        append_request = None
+        if append_ops:
+            append_request = clone_memory_update_request(
+                request,
+                operations=ResolvedOperations(
+                    upsert_operations=append_ops,
+                    delete_file_contents=[],
+                    errors=[],
+                    resolved_links=append_links,
+                ),
+            )
+
+        merge_request = None
+        if merge_ops or operations.delete_file_contents or operations.errors:
+            merge_request = clone_memory_update_request(
+                request,
+                operations=ResolvedOperations(
+                    upsert_operations=merge_ops,
+                    delete_file_contents=list(operations.delete_file_contents or []),
+                    errors=list(operations.errors or []),
+                    resolved_links=merge_links,
+                ),
+            )
+        return append_request, merge_request
+
+    async def _apply_append_only_request_now(
+        self,
+        request: MemoryUpdateRequest,
+    ) -> StreamingMemoryUpdateResult:
+        tracer.info(
+            "StreamingMemoryUpdater fast path started "
+            f"reason=append_only operation_count={_operation_count(request.operations)}",
+            console=self.config.trace_console,
+        )
+        operations = request.operations.model_copy(deep=True)
+        operations.resolved_links = await filter_valid_links(
+            merge_link_lists(list(getattr(operations, "resolved_links", []) or [])),
+            upsert_operations=operations.upsert_operations,
+            delete_file_contents=operations.delete_file_contents,
+            ctx=request.ctx,
+            trace_console=self.config.trace_console,
+        )
+        apply_result = await self._apply_operations(
+            operations=operations,
+            request=request,
+            messages=request.messages,
+        )
+        result = StreamingMemoryUpdateResult(
+            operations=operations,
+            apply_result=apply_result,
+            request_count=1,
+            metadata={
+                "flush_reason": "append_only_fast_path",
+                "operation_count": _operation_count(operations),
+                "fast_path": True,
+                "append_only_operation_count": _operation_count(operations),
+            },
+        )
+        tracer.info(
+            "StreamingMemoryUpdater fast path finished "
+            f"written_uris={apply_result.written_uris} "
+            f"edited_uris={apply_result.edited_uris} "
+            f"deleted_uris={apply_result.deleted_uris} "
+            f"errors={apply_result.errors}",
             console=self.config.trace_console,
         )
         return result
@@ -198,18 +299,10 @@ class StreamingMemoryUpdater:
         )
         merged_operations = await self._merge_requests(requests)
         first_request = requests[0]
-        updater = MemoryUpdater(
-            registry=self.registry,
-            vikingdb=self.vikingdb,
-            transaction_handle=None,
-        )
-        extract_context = ExtractContext(_combined_request_messages(requests))
-        isolation_handler = _make_isolation_handler(first_request, extract_context)
-        apply_result = await updater.apply_operations(
-            merged_operations,
-            first_request.ctx,
-            extract_context=extract_context,
-            isolation_handler=isolation_handler,
+        apply_result = await self._apply_operations(
+            operations=merged_operations,
+            request=first_request,
+            messages=_combined_request_messages(requests),
         )
         result = StreamingMemoryUpdateResult(
             operations=merged_operations,
@@ -231,6 +324,28 @@ class StreamingMemoryUpdater:
             console=self.config.trace_console,
         )
         return result
+
+    async def _apply_operations(
+        self,
+        *,
+        operations: ResolvedOperations,
+        request: MemoryUpdateRequest,
+        messages: list[Message],
+    ) -> MemoryUpdateResult:
+        updater = MemoryUpdater(
+            registry=self.registry,
+            vikingdb=self.vikingdb,
+            transaction_handle=None,
+        )
+        extract_context = ExtractContext(messages)
+        isolation_handler = _make_isolation_handler(request, extract_context)
+        async with self._apply_lock:
+            return await updater.apply_operations(
+                operations,
+                request.ctx,
+                extract_context=extract_context,
+                isolation_handler=isolation_handler,
+            )
 
     async def _merge_requests(self, requests: list[MemoryUpdateRequest]) -> ResolvedOperations:
         all_ops = ResolvedOperations(
@@ -300,9 +415,9 @@ async def merge_memory_operations(
     merged_deletes = list(operations.delete_file_contents)
     merged_links = merge_link_lists(list(getattr(operations, "resolved_links", []) or []))
     registry = registry or create_default_registry()
-    for memory_type, memory_ops in groups.items():
-        try:
-            merged = await merge_one_memory_type_operations(
+    merge_results = await asyncio.gather(
+        *[
+            _merge_memory_type_group(
                 memory_type=memory_type,
                 operations=memory_ops,
                 messages=messages,
@@ -310,24 +425,37 @@ async def merge_memory_operations(
                 registry=registry,
                 trace_console=trace_console,
             )
+            for memory_type, memory_ops in groups.items()
+        ],
+        return_exceptions=True,
+    )
+
+    for (memory_type, memory_ops), merge_result in zip(
+        groups.items(), merge_results, strict=True
+    ):
+        if not isinstance(merge_result, Exception):
+            merged = merge_result
             merged_upserts.extend(merged.upsert_operations)
             merged_deletes.extend(merged.delete_file_contents)
             merged_links = merge_link_lists(
                 merged_links,
                 list(getattr(merged, "resolved_links", []) or []),
             )
-        except Exception as exc:
-            tracer.info(
-                "[streaming_memory_updater] merge fallback "
-                f"memory_type={memory_type} mode=fallback_original "
-                f"reason=llm_merge_failed patch_count={len(memory_ops)} "
-                f"target_count={len(_unique_operation_uris(memory_ops))} error={exc}",
-                console=trace_console,
-            )
-            logger.warning("[streaming_memory_updater] merge failed for %s: %s", memory_type, exc)
-            if strict_extract_errors:
-                raise
-            merged_upserts.extend(memory_ops)
+            continue
+
+        tracer.info(
+            "[streaming_memory_updater] merge fallback "
+            f"memory_type={memory_type} mode=fallback_original "
+            f"reason=llm_merge_failed patch_count={len(memory_ops)} "
+            f"target_count={len(_unique_operation_uris(memory_ops))} error={merge_result}",
+            console=trace_console,
+        )
+        logger.warning(
+            "[streaming_memory_updater] merge failed for %s: %s", memory_type, merge_result
+        )
+        if strict_extract_errors:
+            raise merge_result
+        merged_upserts.extend(memory_ops)
 
     merged_links = await filter_valid_links(
         merged_links,
@@ -341,6 +469,25 @@ async def merge_memory_operations(
         delete_file_contents=merged_deletes,
         errors=list(operations.errors),
         resolved_links=merged_links,
+    )
+
+
+async def _merge_memory_type_group(
+    *,
+    memory_type: str,
+    operations: list[ResolvedOperation],
+    messages: list[Message],
+    ctx: RequestContext,
+    registry: MemoryTypeRegistry,
+    trace_console: bool = False,
+) -> ResolvedOperations:
+    return await merge_one_memory_type_operations(
+        memory_type=memory_type,
+        operations=operations,
+        messages=messages,
+        ctx=ctx,
+        registry=registry,
+        trace_console=trace_console,
     )
 
 
@@ -414,7 +561,7 @@ async def merge_one_memory_type_operations(
         raise ValueError(f"Memory schema not found: {memory_type}")
 
     extract_context = ExtractContext(messages)
-    original_file_uris = list(
+    required_file_uris = list(
         dict.fromkeys(
             uri
             for op in operations
@@ -427,7 +574,7 @@ async def merge_one_memory_type_operations(
     ]
     provider = PatchMergeContextProvider(
         memory_type=memory_type,
-        original_file_uris=original_file_uris,
+        required_file_uris=required_file_uris,
         patches=patches,
     )
     provider._ctx = ctx
@@ -448,8 +595,8 @@ async def merge_one_memory_type_operations(
     vlm = get_openviking_config().vlm.get_vlm_instance()
     tracer.info(
         "[streaming_memory_updater] llm merge input "
-        f"memory_type={memory_type} original_file_count={len(original_file_uris)} "
-        f"original_files={original_file_uris} patch_count={len(patches)} "
+        f"memory_type={memory_type} required_file_count={len(required_file_uris)} "
+        f"required_files={required_file_uris} patch_count={len(patches)} "
         f"target_count={target_count}",
         console=trace_console,
     )
@@ -492,27 +639,34 @@ def operation_to_patch(
     schema: MemoryTypeSchema,
     extract_context: ExtractContext,
 ) -> PatchMergePatch:
-    uri = _first_uri(getattr(op, "uris", []) or [])
     old_file = getattr(op, "old_memory_file_content", None)
-    after_content = render_operation_after_file_content(
-        op, schema=schema, extract_context=extract_context
-    )
-    target_name = str(
-        (getattr(op, "memory_fields", {}) or {}).get("name")
-        or (getattr(op, "memory_fields", {}) or {}).get(f"{op.memory_type.rstrip('s')}_name")
-        or (uri or "").rstrip("/").split("/")[-1].removesuffix(".md")
-        or op.memory_type
+    after_file = render_operation_after_file(
+        op,
+        schema=schema,
+        extract_context=extract_context,
     )
     return PatchMergePatch(
-        target_name=target_name,
-        target_uri=uri,
-        before_content=old_file.plain_content() if old_file is not None else None,
-        after_content=after_content,
+        before_file=old_file,
+        after_file=after_file,
         metadata={
             "memory_type": op.memory_type,
             "memory_fields": dict(getattr(op, "memory_fields", {}) or {}),
         },
     )
+
+
+def render_operation_after_file(
+    op: ResolvedOperation,
+    *,
+    schema: MemoryTypeSchema,
+    extract_context: ExtractContext,
+) -> MemoryFile:
+    after_content = render_operation_after_file_content(
+        op,
+        schema=schema,
+        extract_context=extract_context,
+    )
+    return MemoryFileUtils.read(after_content, uri=_first_uri(getattr(op, "uris", []) or []))
 
 
 def render_operation_after_file_content(
@@ -704,6 +858,97 @@ async def filter_valid_links(
         console=trace_console,
     )
     return valid_links
+
+
+def split_links_for_append_only_ops(
+    links: list[StoredLink],
+    *,
+    append_ops: list[ResolvedOperation],
+    merge_ops: list[ResolvedOperation],
+) -> tuple[list[StoredLink], list[StoredLink]]:
+    append_uris = {uri for op in append_ops for uri in (op.uris or []) if uri}
+    merge_uris = {uri for op in merge_ops for uri in (op.uris or []) if uri}
+    append_links: list[StoredLink] = []
+    merge_links: list[StoredLink] = []
+    for link in links:
+        touches_append = link.from_uri in append_uris or link.to_uri in append_uris
+        touches_merge = link.from_uri in merge_uris or link.to_uri in merge_uris
+        if touches_append and not touches_merge:
+            append_links.append(link)
+        else:
+            merge_links.append(link)
+    return append_links, merge_links
+
+
+def clone_memory_update_request(
+    request: MemoryUpdateRequest,
+    *,
+    operations: ResolvedOperations,
+) -> MemoryUpdateRequest:
+    return MemoryUpdateRequest(
+        operations=operations,
+        messages=list(request.messages or []),
+        ctx=request.ctx,
+        strict_extract_errors=request.strict_extract_errors,
+        isolation_options=dict(request.isolation_options or {}),
+        metadata=dict(request.metadata or {}),
+    )
+
+
+def combine_streaming_memory_results(
+    *results: StreamingMemoryUpdateResult | None,
+    fallback_request_count: int = 0,
+) -> StreamingMemoryUpdateResult:
+    present_results = [result for result in results if result is not None]
+    if not present_results:
+        return StreamingMemoryUpdateResult(
+            operations=ResolvedOperations(upsert_operations=[], delete_file_contents=[], errors=[]),
+            apply_result=MemoryUpdateResult(),
+            request_count=fallback_request_count,
+            metadata={"flush_reason": "empty", "operation_count": 0},
+        )
+    if len(present_results) == 1:
+        return present_results[0]
+
+    combined_operations = ResolvedOperations(
+        upsert_operations=[],
+        delete_file_contents=[],
+        errors=[],
+        resolved_links=[],
+    )
+    combined_apply_result = MemoryUpdateResult()
+    metadata: dict[str, Any] = {
+        "flush_reason": "+".join(
+            str(result.metadata.get("flush_reason", "unknown")) for result in present_results
+        ),
+        "combined_result": True,
+    }
+    request_count = 0
+    for result in present_results:
+        request_count += result.request_count
+        combined_operations.upsert_operations.extend(result.operations.upsert_operations or [])
+        combined_operations.delete_file_contents.extend(result.operations.delete_file_contents or [])
+        combined_operations.errors.extend(result.operations.errors or [])
+        combined_operations.resolved_links = merge_link_lists(
+            combined_operations.resolved_links,
+            list(getattr(result.operations, "resolved_links", []) or []),
+        )
+        combined_apply_result.written_uris.extend(result.apply_result.written_uris)
+        combined_apply_result.edited_uris.extend(result.apply_result.edited_uris)
+        combined_apply_result.deleted_uris.extend(result.apply_result.deleted_uris)
+        combined_apply_result.errors.extend(result.apply_result.errors)
+        for key in ("batch_id", "batch_trace_id"):
+            if result.metadata.get(key):
+                metadata.setdefault(key, result.metadata.get(key))
+        if result.metadata.get("fast_path"):
+            metadata["fast_path"] = True
+    metadata["operation_count"] = _operation_count(combined_operations)
+    return StreamingMemoryUpdateResult(
+        operations=combined_operations,
+        apply_result=combined_apply_result,
+        request_count=request_count or fallback_request_count,
+        metadata=metadata,
+    )
 
 
 def _combined_request_messages(items: list[MemoryUpdateRequest]) -> list[Message]:

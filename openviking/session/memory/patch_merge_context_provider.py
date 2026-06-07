@@ -1,6 +1,6 @@
 # Copyright (c) 2026 Beijing Volcano Engine Technology Co., Ltd.
 # SPDX-License-Identifier: AGPL-3.0
-"""Context provider for merging memory patches via ExtractLoop."""
+"""Context provider for merging structured memory-file patches via ExtractLoop."""
 
 from __future__ import annotations
 
@@ -9,7 +9,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from openviking.server.identity import RequestContext
-from openviking.session.memory.dataclass import MemoryTypeSchema
+from openviking.session.memory.dataclass import MemoryFile, MemoryTypeSchema
 from openviking.session.memory.session_extract_context_provider import (
     SessionExtractContextProvider,
 )
@@ -17,22 +17,50 @@ from openviking.session.memory.session_extract_context_provider import (
 
 @dataclass(slots=True)
 class PatchMergePatch:
-    """A generic before/after memory patch to expose as unified diff context."""
+    """A before/after memory-file patch rendered as field-level line diffs."""
 
-    target_name: str
-    target_uri: str | None
-    before_content: str | None
-    after_content: str
+    before_file: MemoryFile | None
+    after_file: MemoryFile
     metadata: dict[str, Any] = field(default_factory=dict)
+
+    @property
+    def target_uri(self) -> str | None:
+        return self.after_file.uri or (self.before_file.uri if self.before_file is not None else None)
+
+    @property
+    def memory_type(self) -> str:
+        return str(
+            self.after_file.memory_type
+            or (self.before_file.memory_type if self.before_file is not None else "")
+            or self.after_file.extra_fields.get("memory_type")
+            or (
+                self.before_file.extra_fields.get("memory_type")
+                if self.before_file is not None
+                else ""
+            )
+        )
+
+    @property
+    def target_name(self) -> str:
+        fields = self.after_file.extra_fields or {}
+        memory_type = self.memory_type
+        name = (
+            fields.get("experience_name")
+            or fields.get("name")
+            or fields.get(f"{memory_type.rstrip('s')}_name")
+        )
+        if name:
+            return str(name)
+        uri = self.target_uri
+        return uri.rstrip("/").split("/")[-1].removesuffix(".md") if uri else "unknown"
 
 
 class PatchMergeContextProvider(SessionExtractContextProvider):
-    """Provide original memory files and unified patches to ExtractLoop.
+    """Provide original memory files and structured field diffs to ExtractLoop.
 
-    The provider is intentionally generic and does not implement merge rules.
-    Callers decide grouping/filtering/sorting before constructing it; this class
-    only exposes original files as prefetched read results and patch proposals as
-    unified diff text.
+    The provider is generic: callers decide which patches to pass in; this class
+    only exposes original files as prefetched read results and memory-file field
+    diffs as compact merge context.
     """
 
     def __init__(
@@ -41,18 +69,17 @@ class PatchMergeContextProvider(SessionExtractContextProvider):
         memory_type: str,
         patches: list[PatchMergePatch],
         required_file_uris: list[str] | None = None,
-        original_file_uris: list[str] | None = None,
     ):
         super().__init__(messages=[])
         self.memory_type = memory_type
-        self.required_file_uris = list(required_file_uris or original_file_uris or [])
+        self.required_file_uris = list(required_file_uris or [])
         self.patches = list(patches)
 
     def instruction(self) -> str:
         output_language = self._output_language
         return f"""You are a memory patch merge agent.
 
-You are given original memory files and unified patches. Merge them by producing final memory operations that follow the provided JSON schema.
+You are given original memory files and structured memory-file field diffs. Merge them by producing final memory operations that follow the provided JSON schema.
 
 Do not call tools. Output JSON only.
 
@@ -83,7 +110,7 @@ All memory content must be written in {output_language}.
         messages.append(
             {
                 "role": "user",
-                "content": _render_unified_patches(self.patches),
+                "content": _render_field_diff_patches(self.patches),
             }
         )
         return messages
@@ -137,38 +164,103 @@ All memory content must be written in {output_language}.
         return [render_template(schema.directory, {"user_space": user_id})]
 
 
-def _render_unified_patches(patches: list[PatchMergePatch]) -> str:
+def _render_field_diff_patches(patches: list[PatchMergePatch]) -> str:
     if not patches:
-        return "```diff\n# No patches provided.\n```"
-    rendered = [_to_unified_patch(patch).rstrip() for patch in patches]
-    return "```diff\n" + "\n\n".join(rendered).rstrip() + "\n```"
+        return "# Memory File Patches\n\nNo patches provided."
+    rendered = [
+        _render_one_field_diff_patch(index, patch)
+        for index, patch in enumerate(patches, start=1)
+    ]
+    return "# Memory File Patches\n\n" + "\n\n".join(rendered).rstrip()
 
 
-def _to_unified_patch(patch: PatchMergePatch) -> str:
-    target = _patch_target_path(patch)
-    before_lines = [] if patch.before_content is None else patch.before_content.splitlines()
-    after_lines = patch.after_content.splitlines()
-    fromfile = "/dev/null" if patch.before_content is None else f"a/{target}"
-    tofile = f"b/{target}"
-    diff_lines = list(
-        difflib.unified_diff(
-            before_lines,
-            after_lines,
-            fromfile=fromfile,
-            tofile=tofile,
-            lineterm="",
+def _render_one_field_diff_patch(index: int, patch: PatchMergePatch) -> str:
+    lines = [
+        f"## Memory Patch {index}",
+        "",
+        f"target_uri: {patch.target_uri or ''}",
+        f"memory_type: {patch.memory_type}",
+        f"target_name: {patch.target_name}",
+    ]
+    if patch.metadata:
+        lines.append(f"metadata: {_compact_value(patch.metadata)}")
+    field_diffs = _field_diffs(patch.before_file, patch.after_file)
+    if not field_diffs:
+        lines.extend(["", "No changed fields."])
+        return "\n".join(lines)
+    for field_name, diff in field_diffs:
+        lines.extend(
+            [
+                "",
+                f"### Field Diff: {field_name}",
+                "```diff",
+                diff.rstrip(),
+                "```",
+            ]
         )
+    return "\n".join(lines)
+
+
+def _field_diffs(before_file: MemoryFile | None, after_file: MemoryFile) -> list[tuple[str, str]]:
+    before_fields = _memory_file_fields(before_file) if before_file is not None else {}
+    after_fields = _memory_file_fields(after_file)
+    diffs: list[tuple[str, str]] = []
+    for field_name in sorted(set(before_fields) | set(after_fields)):
+        before_value = before_fields.get(field_name)
+        after_value = after_fields.get(field_name)
+        if before_value == after_value:
+            continue
+        diff = _value_unified_diff(
+            field_name=field_name,
+            before_value=before_value,
+            after_value=after_value,
+        )
+        if diff.strip():
+            diffs.append((field_name, diff))
+    return diffs
+
+
+def _memory_file_fields(file: MemoryFile) -> dict[str, Any]:
+    fields = dict(file.extra_fields or {})
+    if file.memory_type is not None:
+        fields["memory_type"] = file.memory_type
+    if file.content:
+        fields["content"] = file.content
+    if file.links:
+        fields["links"] = file.links
+    if file.backlinks:
+        fields["backlinks"] = file.backlinks
+    return fields
+
+
+def _value_unified_diff(*, field_name: str, before_value: Any, after_value: Any) -> str:
+    before_lines = _value_lines(before_value)
+    after_lines = _value_lines(after_value)
+    diff_lines = difflib.unified_diff(
+        before_lines,
+        after_lines,
+        fromfile=f"{field_name}.before",
+        tofile=f"{field_name}.after",
+        n=0,
+        lineterm="",
     )
-    diff_git = f"diff --git {fromfile} {tofile}"
-    if not diff_lines:
-        return diff_git
-    return "\n".join([diff_git, *diff_lines])
+    return "\n".join(diff_lines)
 
 
-def _patch_target_path(patch: PatchMergePatch) -> str:
-    target = patch.target_uri or patch.target_name
-    target = str(target).strip().replace("\n", " ").replace("\r", " ")
-    return target or "unknown"
+def _value_lines(value: Any) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return value.splitlines()
+    import json
+
+    return json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True).splitlines()
+
+
+def _compact_value(value: Any) -> str:
+    import json
+
+    return json.dumps(value, ensure_ascii=False, sort_keys=True)
 
 
 def _dedupe_uris(uris: list[str] | None) -> list[str]:
@@ -182,8 +274,9 @@ def _build_patch_search_query(patches: list[PatchMergePatch]) -> str:
             parts.append(str(patch.target_name))
         if patch.target_uri:
             parts.append(str(patch.target_uri).rstrip("/").split("/")[-1].removesuffix(".md"))
-        if patch.after_content:
-            parts.append(_truncate_query_text(patch.after_content, 1200))
+        content = str(patch.after_file.content or "")
+        if content:
+            parts.append(_truncate_query_text(content, 1200))
     return _truncate_query_text("\n\n".join(parts), 5000)
 
 

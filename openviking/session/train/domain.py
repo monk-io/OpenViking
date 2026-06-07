@@ -88,7 +88,7 @@ class ExperienceSet:
         if self.request_context is None:
             raise RuntimeError("ExperienceSet.request_context is required for policy reload")
 
-        from openviking.session.train.adapters.memory_store import ExperienceSetLoader
+        from openviking.session.train.components.memory_store import ExperienceSetLoader
 
         return await ExperienceSetLoader(viking_fs=self.viking_fs).load(
             self.root_uri,

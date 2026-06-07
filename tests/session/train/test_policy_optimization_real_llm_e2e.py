@@ -16,10 +16,8 @@ from openviking.session.train import (
     Case,
     ContentHashPolicySnapshotter,
     DefaultPolicyOptimizationPipeline,
+    ExperienceGradientContext,
     ExperienceSetLoader,
-    LegacyExperienceGradientContext,
-    LegacyTrajectoryAnalyzerContext,
-    LegacyTrajectoryRolloutAnalyzer,
     ListCaseLoader,
     MemoryFilePolicyUpdater,
     MergeAwarePolicyOptimizer,
@@ -28,8 +26,10 @@ from openviking.session.train import (
     Rubric,
     RubricCriterion,
     SingleTurnLLMRolloutExecutor,
+    TrajectoryAnalyzerContext,
+    TrajectoryRolloutAnalyzer,
 )
-from openviking.session.train.adapters.gradient_estimator import LegacyExperienceGradientEstimator
+from openviking.session.train.components.gradient_estimator import ExperienceGradientEstimator
 from openviking.storage.transaction import init_lock_manager, reset_lock_manager
 from openviking.telemetry import start_current_span, tracer
 from openviking.telemetry.tracer import init_tracer_from_server_config
@@ -41,43 +41,6 @@ def _init_real_llm_e2e_tracer():
     """Initialize tracer from server.observability.traces in ~/.openviking/ov.conf."""
 
     init_tracer_from_server_config(load_server_config())
-
-
-class RealRolloutToTrajectoryCompressor:
-    """Adapter that stores the real LLM rollout as a trajectory memory file.
-
-    The analyzer path is still the production LegacyTrajectoryRolloutAnalyzer;
-    this lightweight compressor only avoids invoking the old trajectory LLM phase
-    a second time in this rollout-focused real-LLM e2e.
-    """
-
-    def __init__(self, trajectory_uri: str, viking_fs: InMemoryVikingFS):
-        self.trajectory_uri = trajectory_uri
-        self.viking_fs = viking_fs
-        self.calls = []
-
-    async def extract_agent_memories(self, **kwargs):
-        self.calls.append(kwargs)
-        assistant_text = "\n".join(
-            message.content for message in kwargs["messages"] if message.role == "assistant"
-        )
-        self.viking_fs.files[self.trajectory_uri] = (
-            "# 重复预订处理轨迹\n"
-            f"{assistant_text}\n\n"
-            "<!-- MEMORY_FIELDS\n"
-            '{"memory_type":"trajectories","trajectory_name":"duplicate_booking_case",'
-            '"outcome":"success","retrieval_anchor":"阶段：最终处理；能力：重复预订处理"}\n'
-            "-->"
-        )
-        return {
-            "contexts": [
-                SimpleNamespace(
-                    uri=self.trajectory_uri,
-                    category="memory_write",
-                )
-            ],
-            "session_skills": [],
-        }
 
 
 class RealRubricTrajectoryAnalyzer:
@@ -474,10 +437,10 @@ def _print_real_llm_e2e_summary(
         f"confidence: {gradient.confidence}",
         "",
         "[Gradient before_content]",
-        str(gradient.patch.before_content),
+        gradient.before_file.plain_content() if gradient.before_file is not None else "None",
         "",
         "[Gradient after_content]",
-        gradient.patch.after_content,
+        gradient.after_file.plain_content(),
     ]
     if written_experience is not None:
         lines.extend(["", "[Written Experience File]", written_experience])
@@ -511,7 +474,6 @@ def _print_iterative_real_llm_summary(*, result, fs: InMemoryVikingFS, experienc
         )
         if iteration.gradients:
             for gradient_idx, gradient in enumerate(iteration.gradients):
-                patch = getattr(gradient, "patch", None)
                 lines.extend(
                     [
                         f"[Iteration {iteration.iteration} Gradient {gradient_idx}]",
@@ -520,13 +482,12 @@ def _print_iterative_real_llm_summary(*, result, fs: InMemoryVikingFS, experienc
                         f"confidence: {gradient.confidence}",
                     ]
                 )
-                if patch is not None:
-                    lines.extend(
-                        [
-                            "gradient_after_content:",
-                            patch.after_content,
-                        ]
-                    )
+                lines.extend(
+                    [
+                        "gradient_after_content:",
+                        gradient.after_file.plain_content(),
+                    ]
+                )
         for analysis in iteration.analyses:
             messages = analysis.metadata.get("rollout_messages", [])
             assistant_text = "\n".join(
@@ -568,7 +529,7 @@ def _print_iterative_real_llm_summary(*, result, fs: InMemoryVikingFS, experienc
     tracer.info("\n".join(lines), console=True)
 
 
-def _patch_legacy_experience_prefetch(
+def _patch_experience_prefetch(
     monkeypatch, fs: InMemoryVikingFS, experience_uri: str
 ) -> None:
     async def search_files(self, query, search_uris=None, limit=5):
@@ -645,7 +606,7 @@ async def _run_policy_optimization_pipeline_real_config_llm_e2e_writes_updated_e
     )
     policy_set = await ExperienceSetLoader(viking_fs=fs).load(root, ctx=request_context)
     vlm = get_openviking_config().vlm
-    _patch_legacy_experience_prefetch(monkeypatch, fs, experience_uri)
+    _patch_experience_prefetch(monkeypatch, fs, experience_uri)
 
     pipeline = DefaultPolicyOptimizationPipeline(
         snapshotter=ContentHashPolicySnapshotter(),
@@ -659,7 +620,7 @@ async def _run_policy_optimization_pipeline_real_config_llm_e2e_writes_updated_e
             viking_fs=fs,
             vlm=vlm,
         ),
-        gradient_estimator=LegacyExperienceGradientEstimator(
+        gradient_estimator=ExperienceGradientEstimator(
             viking_fs=fs,
             vlm=vlm,
         ),
@@ -674,8 +635,8 @@ async def _run_policy_optimization_pipeline_real_config_llm_e2e_writes_updated_e
         case_loader=ListCaseLoader([_case()]),
         policy_set=policy_set,
         context=PipelineContext(
-            analysis_context=LegacyTrajectoryAnalyzerContext(request_context=request_context),
-            gradient_context=LegacyExperienceGradientContext(
+            analysis_context=TrajectoryAnalyzerContext(request_context=request_context),
+            gradient_context=ExperienceGradientContext(
                 request_context=request_context,
                 messages=[],
             ),
@@ -693,7 +654,7 @@ async def _run_policy_optimization_pipeline_real_config_llm_e2e_writes_updated_e
     _print_iterative_real_llm_summary(result=result, fs=fs, experience_uri=experience_uri)
     assert assistant_text.strip()
     assert trajectory_content.strip()
-    assert gradient.patch.after_content.strip()
+    assert gradient.after_file.plain_content().strip()
     assert all(iteration.apply_result.errors == [] for iteration in result.iterations)
     written_uris = [
         uri for iteration in result.iterations for uri in iteration.apply_result.written_uris
@@ -722,7 +683,7 @@ async def _run_policy_optimization_pipeline_real_config_llm_e2e_writes_updated_e
     ignore_args=True,
     is_new_trace=True,
 )
-async def test_legacy_experience_gradient_estimator_real_config_llm_generates_gradient(
+async def test_experience_gradient_estimator_real_config_llm_generates_gradient(
     monkeypatch,
 ):
     root = "viking://user/u/memories/experiences"
@@ -756,14 +717,13 @@ async def test_legacy_experience_gradient_estimator_real_config_llm_generates_gr
     )
     policy_set = await ExperienceSetLoader(viking_fs=fs).load(root, ctx=request_context)
 
-    _patch_legacy_experience_prefetch(monkeypatch, fs, experience_uri)
+    _patch_experience_prefetch(monkeypatch, fs, experience_uri)
 
-    compressor = RealRolloutToTrajectoryCompressor(trajectory_uri=trajectory_uri, viking_fs=fs)
     rollout_executor = SingleTurnLLMRolloutExecutor(
         vlm=get_openviking_config().vlm,
         thinking=False,
     )
-    analyzer = LegacyTrajectoryRolloutAnalyzer(compressor=compressor, viking_fs=fs)
+    analyzer = TrajectoryRolloutAnalyzer(viking_fs=fs)
     snapshotter = ContentHashPolicySnapshotter()
     snapshot_id = await snapshotter.snapshot(policy_set)
     rollouts = await rollout_executor.execute(
@@ -773,17 +733,17 @@ async def test_legacy_experience_gradient_estimator_real_config_llm_generates_gr
     )
     analysis = await analyzer.analyze(
         rollouts[0],
-        LegacyTrajectoryAnalyzerContext(request_context=request_context),
+        TrajectoryAnalyzerContext(request_context=request_context),
     )
 
-    estimator = LegacyExperienceGradientEstimator(
+    estimator = ExperienceGradientEstimator(
         viking_fs=fs,
         vlm=get_openviking_config().vlm,
     )
     gradients = await estimator.estimate(
         analysis,
         policy_set,
-        LegacyExperienceGradientContext(request_context=request_context, messages=[]),
+        ExperienceGradientContext(request_context=request_context, messages=[]),
     )
 
     assert gradients
@@ -794,5 +754,7 @@ async def test_legacy_experience_gradient_estimator_real_config_llm_generates_gr
         gradient=gradient,
     )
     assert gradient.target_experience_name
-    assert gradient.patch.after_content.strip()
-    assert gradient.evidence_trajectory_uris == [trajectory_uri]
+    assert gradient.after_file.plain_content().strip()
+    assert gradient.evidence_trajectory_uris
+    assert gradient.evidence_trajectory_uris[0] in fs.files
+    assert "/memories/trajectories/" in gradient.evidence_trajectory_uris[0]

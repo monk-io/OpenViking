@@ -2,22 +2,22 @@
 # SPDX-License-Identifier: AGPL-3.0
 """Session training framework for trajectory/experience policy optimization."""
 
-from openviking.session.train.adapters.gradient_estimator import (
-    LegacyExperienceGradientContext,
-    LegacyExperienceGradientEstimator,
+from openviking.session.train.components.gradient_estimator import (
+    ExperienceGradientContext,
+    ExperienceGradientEstimator,
 )
-from openviking.session.train.adapters.memory_store import ExperienceSetLoader
-from openviking.session.train.adapters.policy_updater import (
+from openviking.session.train.components.memory_store import ExperienceSetLoader
+from openviking.session.train.components.policy_updater import (
     DryRunPolicyUpdater,
     MemoryFilePolicyUpdater,
 )
-from openviking.session.train.adapters.rollout_executor import (
+from openviking.session.train.components.rollout_executor import (
     SingleTurnLLMRolloutExecutor,
     default_single_turn_prompt,
 )
-from openviking.session.train.adapters.trajectory_analyzer import (
-    LegacyTrajectoryAnalyzerContext,
-    LegacyTrajectoryRolloutAnalyzer,
+from openviking.session.train.components.trajectory_analyzer import (
+    TrajectoryAnalyzerContext,
+    TrajectoryRolloutAnalyzer,
 )
 from openviking.session.train.domain import (
     ApplyResult,
@@ -42,11 +42,7 @@ from openviking.session.train.domain import (
     Trajectory,
     TrajectoryOutcome,
 )
-from openviking.session.train.evaluators import (
-    HeuristicRubricRolloutAnalyzer,
-    LLMRubricRolloutAnalyzer,
-)
-from openviking.session.train.gradients import ExperienceContentPatch, PatchSemanticGradient
+from openviking.session.train.gradients import PatchSemanticGradient
 from openviking.session.train.interfaces import (
     CaseLoader,
     GradientEstimator,
@@ -83,13 +79,10 @@ __all__ = [
     "StreamingPolicyTrainerConfig",
     "StreamingPolicyTrainer",
     "BatchPolicyTrainer",
-    "LegacyExperienceGradientEstimator",
-    "LegacyExperienceGradientContext",
-    "ExperienceContentPatch",
-    "LegacyTrajectoryRolloutAnalyzer",
-    "LegacyTrajectoryAnalyzerContext",
-    "HeuristicRubricRolloutAnalyzer",
-    "LLMRubricRolloutAnalyzer",
+    "ExperienceGradientEstimator",
+    "ExperienceGradientContext",
+    "TrajectoryRolloutAnalyzer",
+    "TrajectoryAnalyzerContext",
     "GroupingPolicyOptimizer",
     "MergeAwarePolicyOptimizer",
     "MergeAwarePolicyOptimizerContext",

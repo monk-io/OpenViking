@@ -41,22 +41,22 @@ from openviking.session.memory.utils.json_parser import JsonUtils
 from openviking.session.memory.utils.memory_file_utils import MemoryFileUtils
 from openviking.session.train import (
     Case,
+    ExperienceGradientContext,
+    ExperienceGradientEstimator,
     ExperienceSetLoader,
-    LegacyExperienceGradientContext,
-    LegacyExperienceGradientEstimator,
     MemoryFilePolicyUpdater,
     MergeAwarePolicyOptimizer,
     MergeAwarePolicyOptimizerContext,
+    PipelineContext,
     Rollout,
     Rubric,
     RubricCriterion,
-    RubricEvaluation,
     StreamingPolicyTrainerConfig,
-    Trajectory,
+    TrajectoryAnalyzerContext,
+    TrajectoryRolloutAnalyzer,
     get_streaming_policy_trainer,
     make_streaming_policy_trainer_key,
 )
-from openviking.session.train.domain import RolloutAnalysis
 from openviking.storage.viking_fs import get_viking_fs
 from openviking.telemetry import tracer
 from openviking_cli.utils import get_logger
@@ -67,46 +67,11 @@ logger = get_logger(__name__)
 _CASES_MEMORY_TYPE = "cases"
 
 
-@dataclass(slots=True)
-class CommitRolloutAnalyzer:
-    """Analyze a real session commit rollout for streaming policy training."""
-
-    @tracer("train.commit_rollout_analyzer.analyze", ignore_result=True, ignore_args=True)
-    async def analyze(self, rollout: Rollout, context: Any = None) -> RolloutAnalysis:
-        del context
-        return RolloutAnalysis(
-            evaluation=RubricEvaluation(
-                passed=True,
-                score=1.0,
-                criterion_results=[],
-                feedback=[],
-                metadata={"source": "session_commit_case_memory"},
-            ),
-            trajectories=[
-                Trajectory(
-                    name=rollout.case.name,
-                    uri=f"memory://session-commit/{rollout.policy_snapshot_id}/{rollout.case.name}",
-                    content=_trajectory_content_from_rollout(rollout),
-                    outcome="success",
-                    retrieval_anchor=rollout.case.task_signature,
-                    metadata={
-                        "source": "session_commit_case_memory",
-                        "policy_snapshot_id": rollout.policy_snapshot_id,
-                    },
-                )
-            ],
-            metadata={
-                "policy_snapshot_id": rollout.policy_snapshot_id,
-                "rollout_messages": rollout.messages,
-                "source": "session_commit_case_memory",
-            },
-        )
-
 
 class SessionCompressorV3:
     """Session compressor with lock-free patch-merge user memory extraction."""
 
-    rollout_analyzer: CommitRolloutAnalyzer | Any = field(default_factory=CommitRolloutAnalyzer)
+    rollout_analyzer: TrajectoryRolloutAnalyzer | Any
     streaming_trainer_config: StreamingPolicyTrainerConfig = field(
         default_factory=StreamingPolicyTrainerConfig
     )
@@ -119,13 +84,16 @@ class SessionCompressorV3:
         vikingdb,
         skill_processor: Optional[Any] = None,
         *,
-        rollout_analyzer: CommitRolloutAnalyzer | Any | None = None,
+        rollout_analyzer: TrajectoryRolloutAnalyzer | Any | None = None,
         streaming_trainer_config: StreamingPolicyTrainerConfig | None = None,
         streaming_memory_updater_config: StreamingMemoryUpdaterConfig | None = None,
     ):
         self.vikingdb = vikingdb
         self.skill_processor = skill_processor
-        self.rollout_analyzer = rollout_analyzer or CommitRolloutAnalyzer()
+        self.rollout_analyzer = rollout_analyzer or TrajectoryRolloutAnalyzer(
+            viking_fs=get_viking_fs(),
+            vikingdb=vikingdb,
+        )
         self.streaming_trainer_config = streaming_trainer_config or StreamingPolicyTrainerConfig()
         self.streaming_memory_updater_config = (
             streaming_memory_updater_config or StreamingMemoryUpdaterConfig()
@@ -254,7 +222,7 @@ class SessionCompressorV3:
         allow_self_memory: bool = True,
         allowed_peer_ids: Optional[set[str]] = None,
     ):
-        result = await self._extract_long_term_memories_patch_merge(
+        result = await self._extract_user_memories(
             messages=list(messages),
             user=user,
             session_id=session_id,
@@ -279,7 +247,7 @@ class SessionCompressorV3:
     @tracer(
         "train.compressor_v3.extract_long_term_patch_merge", ignore_result=True, ignore_args=True
     )
-    async def _extract_long_term_memories_patch_merge(
+    async def _extract_user_memories(
         self,
         messages: List[Message],
         user: Optional[Any] = None,
@@ -398,7 +366,7 @@ class SessionCompressorV3:
                 ctx=ctx,
             )
             optimizer_context = MergeAwarePolicyOptimizerContext(request_context=ctx)
-            gradient_context = LegacyExperienceGradientContext(
+            gradient_context = ExperienceGradientContext(
                 request_context=ctx,
                 messages=list(messages),
                 strict_extract_errors=strict_extract_errors,
@@ -410,7 +378,7 @@ class SessionCompressorV3:
                 ),
                 policy_set=policy_set,
                 rollout_analyzer=self.rollout_analyzer,
-                gradient_estimator=LegacyExperienceGradientEstimator(
+                gradient_estimator=ExperienceGradientEstimator(
                     viking_fs=viking_fs,
                 ),
                 policy_optimizer=MergeAwarePolicyOptimizer(
@@ -418,8 +386,12 @@ class SessionCompressorV3:
                     memory_type="experiences",
                 ),
                 policy_updater=MemoryFilePolicyUpdater(viking_fs=viking_fs),
-                context=_TrainerContext(
-                    analysis_context=None,
+                context=PipelineContext(
+                    analysis_context=TrajectoryAnalyzerContext(
+                        request_context=ctx,
+                        strict_extract_errors=strict_extract_errors,
+                        archive_uri=archive_uri,
+                    ),
                     gradient_context=gradient_context,
                     optimization_context=optimizer_context,
                     apply_context=ctx,
@@ -455,16 +427,6 @@ class SessionCompressorV3:
 class _V3ExtractionResult:
     contexts: list[Context] = field(default_factory=list)
     cases: list[Case] = field(default_factory=list)
-
-
-@dataclass(slots=True)
-class _TrainerContext:
-    """Small structural context accepted by StreamingPolicyTrainer core."""
-
-    analysis_context: Any = None
-    gradient_context: Any = None
-    optimization_context: Any = None
-    apply_context: Any = None
 
 
 def _contexts_from_update_result(result: Any) -> list[Context]:

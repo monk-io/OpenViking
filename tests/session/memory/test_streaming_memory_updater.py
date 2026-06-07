@@ -97,6 +97,27 @@ def _registry() -> MemoryTypeRegistry:
             ],
         )
     )
+    registry.register(
+        MemoryTypeSchema(
+            memory_type="notes",
+            description="note memory",
+            directory="viking://user/{{ user_space }}/memories/notes",
+            filename_template="{{ note_name }}.md",
+            operation_mode="upsert",
+            fields=[
+                MemoryField(
+                    name="note_name",
+                    field_type=FieldType.STRING,
+                    merge_op=MergeOp.IMMUTABLE,
+                ),
+                MemoryField(
+                    name="content",
+                    field_type=FieldType.STRING,
+                    merge_op=MergeOp.PATCH,
+                ),
+            ],
+        )
+    )
     return registry
 
 
@@ -110,6 +131,18 @@ def _case_op(name: str) -> ResolvedOperation:
             "task_signature": f"{name} signature",
             "input": '{"summary":"case input"}',
             "rubric": '{"criteria":[{"name":"done","description":"done","required":true,"weight":1.0}]}',
+        },
+    )
+
+
+def _note_op(name: str) -> ResolvedOperation:
+    return ResolvedOperation(
+        old_memory_file_content=None,
+        memory_type="notes",
+        uris=[f"viking://user/u/memories/notes/{name}.md"],
+        memory_fields={
+            "note_name": name,
+            "content": f"{name} content",
         },
     )
 
@@ -157,7 +190,7 @@ async def test_streaming_memory_updater_submit_applies_fast_path(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_streaming_memory_updater_batches_concurrent_submits_and_filters_links(monkeypatch):
+async def test_streaming_memory_updater_fast_path_filters_links(monkeypatch):
     fs = InMemoryVikingFS(
         {
             "viking://user/u/memories/events/existing.md": (
@@ -186,7 +219,6 @@ async def test_streaming_memory_updater_batches_concurrent_submits_and_filters_l
         ),
     )
     op1 = _case_op("并发案例A")
-    op2 = _case_op("并发案例B")
     link = StoredLink(
         from_uri=op1.uris[0],
         to_uri="viking://user/u/memories/events/existing.md",
@@ -197,13 +229,58 @@ async def test_streaming_memory_updater_batches_concurrent_submits_and_filters_l
     )
     duplicate_link = link.model_copy(update={"weight": 0.6, "description": "short"})
     missing_link = StoredLink(
-        from_uri=op2.uris[0],
+        from_uri=op1.uris[0],
         to_uri="viking://user/u/memories/events/missing.md",
         link_type="related_to",
         weight=0.9,
         match_text="缺失",
         description="invalid link",
     )
+
+    result = await updater.submit(
+        MemoryUpdateRequest(
+            operations=ResolvedOperations(
+                upsert_operations=[op1],
+                delete_file_contents=[],
+                errors=[],
+                resolved_links=[link, duplicate_link, missing_link],
+            ),
+            messages=[Message(id="m1", role="user", parts=[TextPart("并发A")])],
+            ctx=_ctx(),
+        )
+    )
+
+    assert result.request_count == 1
+    assert result.metadata["flush_reason"] == "append_only_fast_path"
+    assert len(result.operations.upsert_operations) == 1
+    assert len(result.operations.resolved_links) == 1
+    assert result.operations.resolved_links[0].to_uri.endswith("/events/existing.md")
+    assert result.apply_result.written_uris == [op1.uris[0]]
+
+
+@pytest.mark.asyncio
+async def test_streaming_memory_updater_batches_non_append_only_submits(monkeypatch):
+    fs = InMemoryVikingFS({})
+    fs.search = AsyncMock(return_value=[])
+    monkeypatch.setattr(
+        "openviking.session.memory.streaming_memory_updater.get_viking_fs",
+        lambda: fs,
+    )
+    monkeypatch.setattr(
+        "openviking.session.memory.memory_updater.get_viking_fs",
+        lambda: fs,
+    )
+
+    updater = StreamingMemoryUpdater(
+        registry=_registry(),
+        config=StreamingMemoryUpdaterConfig(
+            max_operations_per_update=2,
+            max_wait_seconds=0.01,
+            timer_check_interval_seconds=0.01,
+        ),
+    )
+    op1 = _note_op("note_a")
+    op2 = _note_op("note_b")
 
     result1, result2 = await asyncio.gather(
         updater.submit(
@@ -212,9 +289,8 @@ async def test_streaming_memory_updater_batches_concurrent_submits_and_filters_l
                     upsert_operations=[op1],
                     delete_file_contents=[],
                     errors=[],
-                    resolved_links=[link, duplicate_link],
                 ),
-                messages=[Message(id="m1", role="user", parts=[TextPart("并发A")])],
+                messages=[Message(id="m1", role="user", parts=[TextPart("note A")])],
                 ctx=_ctx(),
             )
         ),
@@ -224,9 +300,8 @@ async def test_streaming_memory_updater_batches_concurrent_submits_and_filters_l
                     upsert_operations=[op2],
                     delete_file_contents=[],
                     errors=[],
-                    resolved_links=[missing_link],
                 ),
-                messages=[Message(id="m2", role="user", parts=[TextPart("并发B")])],
+                messages=[Message(id="m2", role="user", parts=[TextPart("note B")])],
                 ctx=_ctx(),
             )
         ),
@@ -234,7 +309,5 @@ async def test_streaming_memory_updater_batches_concurrent_submits_and_filters_l
 
     assert result1 is result2
     assert result1.request_count == 2
-    assert len(result1.operations.upsert_operations) == 2
-    assert len(result1.operations.resolved_links) == 1
-    assert result1.operations.resolved_links[0].to_uri.endswith("/events/existing.md")
+    assert result1.metadata["flush_reason"] == "count"
     assert sorted(result1.apply_result.written_uris) == sorted([op1.uris[0], op2.uris[0]])

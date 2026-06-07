@@ -1,268 +1,363 @@
-# Copyright (c) 2026 Beijing Volcano Engine Technology Co., Ltd.
-# SPDX-License-Identifier: AGPL-3.0
+#!/usr/bin/env python3
+"""
+OpenViking V3 cases memory live integration test.
 
-"""Integration coverage for V3 case-memory extraction from session dialogue."""
+This follows the style of ``test_compressor_v2_xiaomei.py``: it connects to a
+running local OpenViking HTTP service, writes dialogue via add_message, commits
+the session, and verifies that V3 extracts a trainable ``cases`` memory.
+
+Prerequisites for a full pass:
+- OpenViking server is running locally (default: http://localhost:1933)
+- Server config uses memory.version = "v3"
+- Server has a usable VLM/embedding configuration for memory extraction
+"""
 
 from __future__ import annotations
 
-import asyncio
+import argparse
 import json
-from types import SimpleNamespace
-from unittest.mock import AsyncMock
+import time
+from datetime import datetime
+from typing import Any
 
+import httpx
 import pytest
-import pytest_asyncio
+from rich.console import Console
+from rich.panel import Panel
+from rich.table import Table
 
-from openviking import AsyncOpenViking
-from openviking.message import TextPart
-from openviking.service.task_tracker import TaskStatus, get_task_tracker, reset_task_tracker
-from openviking.session.compressor_v3 import SessionCompressorV3
-from openviking.session.memory.dataclass import ResolvedOperation, ResolvedOperations
-from openviking.session.memory.memory_isolation_handler import MemoryIsolationHandler
-from openviking.session.memory.memory_type_registry import create_default_registry
-from openviking.session.memory.memory_updater import ExtractContext, MemoryUpdater
-from openviking.session.train import StreamingPolicyTrainerConfig
-from openviking_cli.utils.config.open_viking_config import OpenVikingConfigSingleton
+import openviking as ov
+
+try:
+    from openviking_live_auth import API_KEY_HELP, resolve_api_key
+except ModuleNotFoundError:  # pytest/package import path
+    from tests.integration.openviking_live_auth import API_KEY_HELP, resolve_api_key
+
+# ── Constants ────────────────────────────────────────────────────────────────
+
+DISPLAY_NAME = "V3 Case Extraction"
+DEFAULT_URL = "http://localhost:1933"
+DEFAULT_API_KEY = None
+DEFAULT_SESSION_ID = "v3-case-extraction-demo"
+PANEL_WIDTH = 90
+TASK_POLL_INTERVAL_SECONDS = 1.0
+TASK_TIMEOUT_SECONDS = 240.0
+
+console = Console()
+
+# ── Dialogue that should trigger cases extraction ───────────────────────────
+
+CONVERSATION = [
+    {
+        "user": "请帮我处理酒店重复预订，只取消确认是重复的那一单，保留有效订单。",
+        "assistant": (
+            "我先核对两个预订候选：订单 A 是用户主动确认保留的有效订单；订单 B 的入住日期、"
+            "房型、入住人都与 A 相同，并且系统标记为 duplicate_candidate。"
+        ),
+    },
+    {
+        "user": "对，只能取消重复的那个，别影响我真正要住的订单。",
+        "assistant": (
+            "已确认 B 是重复订单，A 是有效订单。我只取消订单 B，并保留订单 A。"
+            "取消后我再次检查，A 仍为 confirmed，B 已为 cancelled。"
+        ),
+    },
+]
+
+VERIFY_KEYWORDS = ["重复", "预订", "取消", "保留", "订单"]
+CASES_DIR = "viking://user/default/memories/cases"
 
 
-async def _wait_for_task(task_id: str, timeout: float = 10.0) -> dict:
-    """Poll the task tracker until a background session commit finishes."""
-    tracker = get_task_tracker()
-    deadline = asyncio.get_running_loop().time() + timeout
-    while asyncio.get_running_loop().time() < deadline:
-        task = await tracker.get(task_id)
-        if task and task.status in (TaskStatus.COMPLETED, TaskStatus.FAILED):
-            return task.to_dict()
-        await asyncio.sleep(0.05)
+# ── Helpers ─────────────────────────────────────────────────────────────────
+
+
+def _log(message: str) -> None:
+    console.print(f"[cyan][v3-case-extraction][/cyan] {message}")
+
+
+
+def _local_server_available(url: str = DEFAULT_URL) -> bool:
+    try:
+        response = httpx.get(f"{url.rstrip('/')}/health", timeout=2.0)
+        return response.status_code == 200
+    except Exception:
+        return False
+
+
+def _wait_for_task(client: ov.SyncHTTPClient, task_id: str, timeout: float) -> dict[str, Any]:
+    started = time.time()
+    while time.time() - started < timeout:
+        task = client.get_task(task_id)
+        status = task.get("status") if task else "not_found"
+        _log(f"poll task: task_id={task_id} status={status}")
+        if task and status in ("completed", "failed"):
+            elapsed = time.time() - started
+            _log(f"task finished: status={status} elapsed={elapsed:.2f}s result={task.get('result')}")
+            return task
+        time.sleep(TASK_POLL_INTERVAL_SECONDS)
     raise TimeoutError(f"Task {task_id} did not finish within {timeout}s")
 
 
-@pytest_asyncio.fixture(scope="function")
-async def v3_case_client(tmp_path, monkeypatch):
-    """Create an embedded client configured to use SessionCompressorV3."""
-    reset_task_tracker()
-    await AsyncOpenViking.reset()
-    OpenVikingConfigSingleton.reset_instance()
+def _entry_uri(entry: Any, parent: str) -> str:
+    if isinstance(entry, dict):
+        uri = entry.get("uri")
+        if uri:
+            return str(uri)
+        name = entry.get("name")
+        if name:
+            return f"{parent.rstrip('/')}/{name}"
+    uri = getattr(entry, "uri", None)
+    if uri:
+        return str(uri)
+    name = getattr(entry, "name", None)
+    if name:
+        return f"{parent.rstrip('/')}/{name}"
+    return str(entry)
 
-    workspace = tmp_path / "ov_v3_case_extraction"
-    monkeypatch.setattr(
-        "openviking.core.directories.DirectoryInitializer._ensure_directory_l0_l1_vectors",
-        AsyncMock(return_value=None),
-    )
-    OpenVikingConfigSingleton.initialize(
-        config_dict={
-            "storage": {
-                "workspace": str(workspace),
-                "skip_process_lock": True,
-                "agfs": {"backend": "local"},
-                "vectordb": {
-                    "backend": "local",
-                    "name": "test",
-                    "project": "default",
-                    "dimension": 512,
-                },
-            },
-            "memory": {
-                "version": "v3",
-                "agent_memory_enabled": False,
-                "session_skill_extraction_enabled": False,
-            },
-            "embedding": {
-                "dense": {
-                    "provider": "openai",
-                    "model": "text-embedding-3-small",
-                    "api_key": "fake-key",
-                    "api_base": "http://127.0.0.1:9/v1",
-                    "dimension": 512,
-                }
-            },
-        }
-    )
 
-    client = AsyncOpenViking(path=str(workspace))
-    await client.initialize()
+
+def _read_memory_diff(client: ov.SyncHTTPClient, archive_uri: str | None) -> dict[str, Any]:
+    if not archive_uri:
+        return {}
+    diff_uri = f"{archive_uri.rstrip('/')}/memory_diff.json"
     try:
-        yield client
+        raw = client.read(diff_uri)
+        data = json.loads(raw)
+        ops = data.get("operations") or {}
+        for kind in ("adds", "updates", "deletes"):
+            for item in ops.get(kind, []) or []:
+                _log(
+                    "memory_diff "
+                    f"{kind[:-1] if kind.endswith('s') else kind}: "
+                    f"type={item.get('memory_type')} uri={item.get('uri')}"
+                )
+        return data
+    except Exception as exc:
+        _log(f"memory_diff not readable: uri={diff_uri} error={exc}")
+        return {}
+
+
+def _case_entries_from_memory_diff(diff: dict[str, Any]) -> list[str]:
+    entries: list[str] = []
+    operations = diff.get("operations") or {}
+    for kind in ("adds", "updates"):
+        for item in operations.get(kind, []) or []:
+            if item.get("memory_type") == "cases" and item.get("uri"):
+                entries.append(str(item["uri"]))
+    return entries
+
+
+def _read_case_memories(client: ov.SyncHTTPClient) -> list[tuple[str, str]]:
+    try:
+        entries = client.ls(CASES_DIR)
+    except Exception as exc:
+        _log(f"cases dir not readable yet: {CASES_DIR} error={exc}")
+        return []
+
+    memories: list[tuple[str, str]] = []
+    for entry in entries or []:
+        uri = _entry_uri(entry, CASES_DIR)
+        if not uri.endswith(".md") or uri.endswith("/.overview.md") or uri.endswith("/.abstract.md"):
+            continue
+        try:
+            content = client.read(uri)
+        except Exception as exc:
+            _log(f"skip unreadable case memory: uri={uri} error={exc}")
+            continue
+        memories.append((uri, content))
+    return memories
+
+
+# ── Phase 1: ingest dialogue and commit session ─────────────────────────────
+
+
+def run_ingest(
+    client: ov.SyncHTTPClient,
+    session_id: str = DEFAULT_SESSION_ID,
+    *,
+    wait_processed: bool = True,
+    task_timeout: float = TASK_TIMEOUT_SECONDS,
+) -> dict[str, Any]:
+    console.rule(f"[bold]Phase 1: 写入对话并提交 Session — {DISPLAY_NAME}[/bold]")
+
+    create_result = client.create_session(session_id=session_id)
+    session_id = create_result.get("session_id", session_id)
+    _log(f"session created: session_id={session_id}")
+
+    session_time = datetime(2026, 6, 7, 9, 30)
+    session_time_str = session_time.isoformat()
+
+    for index, turn in enumerate(CONVERSATION, 1):
+        _log(f"add dialogue turn {index}/{len(CONVERSATION)}")
+        client.add_message(
+            session_id,
+            role="user",
+            parts=[{"type": "text", "text": turn["user"]}],
+            created_at=session_time_str,
+        )
+        client.add_message(
+            session_id,
+            role="assistant",
+            parts=[{"type": "text", "text": turn["assistant"]}],
+            created_at=session_time_str,
+        )
+
+    _log(f"added messages: count={len(CONVERSATION) * 2}")
+    _log("commit session: trigger archive + V3 long-term extraction")
+    commit_result = client.commit_session(
+        session_id,
+        memory_policy={"self": {"enabled": True}, "peer": {"enabled": False}},
+    )
+    _log(
+        "commit accepted: "
+        f"task_id={commit_result.get('task_id')} archive_uri={commit_result.get('archive_uri')} "
+        f"trace_id={commit_result.get('trace_id')}"
+    )
+
+    task = None
+    task_id = commit_result.get("task_id")
+    if task_id:
+        task = _wait_for_task(client, task_id, task_timeout)
+        if task.get("status") == "failed":
+            raise AssertionError(f"session commit task failed: {task}")
+
+    if wait_processed:
+        _log("wait_processed: drain vectorization/semantic queues")
+        client.wait_processed(timeout=task_timeout)
+
+    session_info = client.get_session(session_id)
+    _log(f"session info: {session_info}")
+    return {"session_id": session_id, "commit": commit_result, "task": task}
+
+
+# ── Phase 2: verify cases memory ────────────────────────────────────────────
+
+
+def run_verify(client: ov.SyncHTTPClient, archive_uri: str | None = None) -> list[tuple[str, str]]:
+    console.rule(f"[bold]Phase 2: 验证 cases 记忆写入 — {DISPLAY_NAME}[/bold]")
+
+    diff = _read_memory_diff(client, archive_uri)
+    diff_case_uris = _case_entries_from_memory_diff(diff)
+    memories = _read_case_memories(client)
+    table = Table(title="V3 cases memories", show_header=True, header_style="bold")
+    table.add_column("#", width=4)
+    table.add_column("URI", style="cyan", max_width=56)
+    table.add_column("命中关键词", style="green")
+    table.add_column("片段", max_width=80)
+
+    for index, (uri, content) in enumerate(memories, 1):
+        hits = [keyword for keyword in VERIFY_KEYWORDS if keyword in content]
+        snippet = content.replace("\n", " ")[:160]
+        table.add_row(str(index), uri, ", ".join(hits), snippet)
+        _log(f"case memory: uri={uri} chars={len(content)} hits={hits}")
+
+    console.print(table)
+
+    matching = [
+        (uri, content)
+        for uri, content in memories
+        if "重复" in content and "预订" in content and ("取消" in content or "保留" in content)
+    ]
+    if not matching and diff_case_uris:
+        # Directory listing can lag/shape-shift across deployments; if memory_diff says
+        # cases were written, read those URIs directly.
+        for uri in diff_case_uris:
+            try:
+                content = client.read(uri)
+            except Exception as exc:
+                _log(f"case uri from memory_diff unreadable: uri={uri} error={exc}")
+                continue
+            if "重复" in content and "预订" in content and ("取消" in content or "保留" in content):
+                matching.append((uri, content))
+
+    if not matching:
+        diff_types = []
+        operations = diff.get("operations") or {}
+        for kind in ("adds", "updates", "deletes"):
+            diff_types.extend(
+                str(item.get("memory_type"))
+                for item in operations.get(kind, []) or []
+                if item.get("memory_type")
+            )
+        raise AssertionError(
+            "No V3 cases memory matched duplicate-booking evidence. "
+            f"cases_dir={CASES_DIR} memory_count={len(memories)} "
+            f"memory_diff_types={diff_types}"
+        )
+    return matching
+
+
+# ── Pytest entry: requires local server ─────────────────────────────────────
+
+
+@pytest.mark.integration
+@pytest.mark.skipif(
+    not _local_server_available(DEFAULT_URL),
+    reason=f"OpenViking local server is not running at {DEFAULT_URL}",
+)
+def test_local_service_add_dialogue_commit_triggers_v3_case_extraction():
+    client = ov.SyncHTTPClient(url=DEFAULT_URL, api_key=resolve_api_key(), timeout=300)
+    try:
+        client.initialize()
+        ingest = run_ingest(client, session_id=f"{DEFAULT_SESSION_ID}-{int(time.time())}")
+        matches = run_verify(client, archive_uri=ingest["commit"].get("archive_uri"))
+        assert matches
     finally:
-        tracker = get_task_tracker()
-        for _ in range(100):
-            pending = [
-                task
-                for task in await tracker.list_tasks()
-                if task.status in (TaskStatus.PENDING, TaskStatus.RUNNING)
-            ]
-            if not pending:
-                break
-            await asyncio.sleep(0.05)
-        await client.close()
-        await AsyncOpenViking.reset()
-        reset_task_tracker()
-        OpenVikingConfigSingleton.reset_instance()
+        client.close()
 
 
-@pytest.mark.asyncio
-async def test_add_dialogue_commit_triggers_v3_case_extraction(v3_case_client, monkeypatch):
-    """Adding a concrete task dialogue and committing should extract/train a cases memory."""
-    client = v3_case_client
-    extracted_messages = []
-    trained_cases = []
+# ── CLI entry, like test_compressor_v2_xiaomei.py ───────────────────────────
 
-    case_operation = ResolvedOperation(
-        old_memory_file_content=None,
-        memory_type="cases",
-        uris=["viking://user/default/memories/cases/重复预订处理.md"],
-        memory_fields={
-            "case_name": "重复预订处理",
-            "task_signature": "处理重复预订并只取消确认重复的订单",
-            "input": json.dumps(
-                {
-                    "summary": "用户要求处理重复预订并保留有效订单",
-                    "preconditions": ["存在两个相似预订候选"],
-                },
-                ensure_ascii=False,
-            ),
-            "rubric": json.dumps(
-                {
-                    "name": "重复预订处理Rubric",
-                    "description": "验证重复订单并安全取消",
-                    "criteria": [
-                        {
-                            "name": "先验证重复",
-                            "description": "取消前必须确认哪一单是重复订单",
-                            "required": True,
-                            "weight": 0.6,
-                        },
-                        {
-                            "name": "只取消重复项",
-                            "description": "不得影响有效订单",
-                            "required": True,
-                            "weight": 0.4,
-                        },
-                    ],
-                },
-                ensure_ascii=False,
-            ),
-            "evidence": "助手读取两个候选预订，确认第二单重复后仅取消该重复项。",
-        },
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=f"OpenViking V3 cases live test — {DISPLAY_NAME}")
+    parser.add_argument("--url", default=DEFAULT_URL, help=f"Server URL (default: {DEFAULT_URL})")
+    parser.add_argument(
+        "--api-key",
+        default=None,
+        help=API_KEY_HELP,
+    )
+    parser.add_argument("--session-id", default=DEFAULT_SESSION_ID, help="Session ID")
+    parser.add_argument(
+        "--phase",
+        choices=["all", "ingest", "verify"],
+        default="all",
+        help="all=ingest+verify, ingest=only submit session, verify=only read cases",
+    )
+    parser.add_argument("--timeout", type=float, default=TASK_TIMEOUT_SECONDS, help="Task timeout")
+    args = parser.parse_args()
+
+    console.print(
+        Panel(
+            f"[bold]OpenViking V3 cases live test — {DISPLAY_NAME}[/bold]\n"
+            f"Server: {args.url} | Phase: {args.phase}",
+            style="magenta",
+            width=PANEL_WIDTH,
+        )
     )
 
-    class FakeOrchestrator:
-        async def run(self):
-            return (
-                ResolvedOperations(
-                    upsert_operations=[case_operation],
-                    delete_file_contents=[],
-                    errors=[],
-                ),
-                [],
-            )
+    api_key = resolve_api_key(args.api_key)
+    if api_key:
+        _log("api key resolved from --api-key/env/ov.conf (not printed)")
+    else:
+        _log("no api key resolved; relying on SyncHTTPClient ovcli.conf auto-load")
+    client = ov.SyncHTTPClient(url=args.url, api_key=api_key, timeout=max(args.timeout, 60))
+    try:
+        client.initialize()
+        _log(f"connected: {args.url}")
+        ingest = None
+        if args.phase in ("all", "ingest"):
+            ingest = run_ingest(client, session_id=args.session_id, task_timeout=args.timeout)
+        if args.phase in ("all", "verify"):
+            archive_uri = ingest["commit"].get("archive_uri") if ingest else None
+            run_verify(client, archive_uri=archive_uri)
+        console.print(Panel("[bold green]V3 cases live test completed[/bold green]", style="green"))
+    except Exception as exc:
+        console.print(Panel(f"[bold red]Error:[/bold red] {exc}", style="red"))
+        raise
+    finally:
+        client.close()
 
-    def fake_get_or_create_react(self, **kwargs):
-        extracted_messages.extend(kwargs["messages"])
-        return FakeOrchestrator()
 
-    class FakeStreamingUpdater:
-        async def submit(self, request):
-            assert request.ctx is not None
-            isolation_options = dict(request.isolation_options or {})
-            assert isolation_options["allowed_memory_types"] is not None
-            assert "cases" in isolation_options["allowed_memory_types"]
-            extract_context = ExtractContext(request.messages)
-            isolation_handler = MemoryIsolationHandler(
-                request.ctx,
-                extract_context,
-                allowed_memory_types=isolation_options.get("allowed_memory_types"),
-                allow_self=isolation_options.get("allow_self", True),
-                allowed_peer_ids=isolation_options.get("allowed_peer_ids"),
-            )
-            result = await MemoryUpdater(
-                registry=create_default_registry(),
-                vikingdb=None,
-            ).apply_operations(
-                request.operations,
-                request.ctx,
-                extract_context=extract_context,
-                isolation_handler=isolation_handler,
-            )
-            return SimpleNamespace(
-                operations=request.operations,
-                apply_result=result,
-                request_count=1,
-                metadata={},
-            )
-
-    async def fake_train_from_extracted_cases(self, *, cases, messages, ctx, **kwargs):
-        del ctx, kwargs
-        trained_cases.extend(cases)
-        assert list(messages) == extracted_messages
-        return {"case_count": len(cases), "submitted": len(cases)}
-
-    monkeypatch.setattr(SessionCompressorV3, "_get_or_create_react", fake_get_or_create_react)
-    monkeypatch.setattr(
-        SessionCompressorV3,
-        "train_from_extracted_cases",
-        fake_train_from_extracted_cases,
-    )
-    monkeypatch.setattr(
-        "openviking.session.compressor_v3.get_streaming_memory_updater",
-        AsyncMock(return_value=FakeStreamingUpdater()),
-    )
-    monkeypatch.setattr(
-        "openviking.session.session.get_openviking_config",
-        lambda: SimpleNamespace(
-            memory=SimpleNamespace(
-                extraction_enabled=True,
-                agent_memory_enabled=False,
-                session_skill_extraction_enabled=False,
-            )
-        ),
-    )
-    monkeypatch.setattr(
-        "openviking.session.session.Session._generate_archive_summary_async",
-        AsyncMock(return_value="# Summary\n用户要求处理重复预订，助手验证并取消重复项。"),
-    )
-    monkeypatch.setattr(
-        "openviking.core.directories.DirectoryInitializer._ensure_directory_l0_l1_vectors",
-        AsyncMock(return_value=None),
-    )
-
-    compressor = client._client.service.session_compressor
-    assert isinstance(compressor, SessionCompressorV3)
-    compressor.streaming_trainer_config = StreamingPolicyTrainerConfig(max_wait_seconds=3600)
-
-    session_id = "v3_case_dialogue_session"
-    await client.add_message(
-        session_id=session_id,
-        role="user",
-        content="请帮我处理酒店重复预订，只取消确认是重复的那一单，保留有效订单。",
-    )
-    await client.add_message(
-        session_id=session_id,
-        role="assistant",
-        content=(
-            "我已读取两个预订候选：A 是原始有效订单，B 与 A 时间和房型相同且状态为重复。"
-            "我将只取消 B。"
-        ),
-    )
-    await client.add_message(
-        session_id=session_id,
-        role="assistant",
-        content="已取消重复订单 B，保留订单 A，并向用户确认没有影响有效订单。",
-    )
-
-    commit = await client.commit_session(session_id)
-    task = await _wait_for_task(commit["task_id"])
-
-    assert task["status"] == "completed"
-    assert task["result"]["memories_extracted"] == {"memory_write": 1}
-    assert [message.role for message in extracted_messages] == ["user", "assistant", "assistant"]
-    assert "酒店重复预订" in extracted_messages[0].content
-    assert len(trained_cases) == 1
-    assert trained_cases[0].name == "重复预订处理"
-    assert trained_cases[0].input["summary"] == "用户要求处理重复预订并保留有效订单"
-    assert trained_cases[0].rubric.criteria[0].name == "先验证重复"
-
-    memory_file = await client.read(case_operation.uris[0])
-    assert "# 重复预订处理" in memory_file
-    assert "## Rubric" in memory_file
-    assert "只取消确认重复的订单" in memory_file
+if __name__ == "__main__":
+    main()

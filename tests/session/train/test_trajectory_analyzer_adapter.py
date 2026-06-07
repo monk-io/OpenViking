@@ -8,42 +8,60 @@ from types import SimpleNamespace
 import pytest
 
 from openviking.message import Message, TextPart
+from openviking.session.memory.dataclass import ResolvedOperation, ResolvedOperations
 from openviking.session.train import Case, Rollout, Rubric
-from openviking.session.train.adapters.trajectory_analyzer import (
-    LegacyTrajectoryAnalyzerContext,
-    LegacyTrajectoryRolloutAnalyzer,
+from openviking.session.train.components.trajectory_analyzer import (
+    TrajectoryAnalyzerContext,
+    TrajectoryRolloutAnalyzer,
 )
 
 
-class FakeCompressor:
-    def __init__(self):
-        self.calls = []
+class FakeExtractLoop:
+    created = []
 
-    async def extract_agent_memories(self, **kwargs):
-        self.calls.append(kwargs)
-        return {
-            "contexts": [
-                SimpleNamespace(
-                    uri="viking://user/u/memories/trajectories/task_2026.md",
-                    category="memory_write",
-                ),
-                SimpleNamespace(
-                    uri="viking://user/u/memories/experiences/ignored.md",
-                    category="memory_write",
-                ),
-            ],
-            "session_skills": [],
-        }
+    def __init__(self, **kwargs):
+        self.kwargs = kwargs
+        self._transaction_handle = None
+        FakeExtractLoop.created.append(self)
+
+    async def run(self):
+        return (
+            ResolvedOperations(
+                upsert_operations=[
+                    ResolvedOperation(
+                        old_memory_file_content=None,
+                        memory_fields={
+                            "trajectory_name": "task",
+                            "outcome": "success",
+                            "retrieval_anchor": "Stage: final",
+                            "content": "# task\nbody",
+                        },
+                        memory_type="trajectories",
+                        uris=["viking://user/u/memories/trajectories/task_20260607120000.md"],
+                        page_id=100,
+                    )
+                ],
+                delete_file_contents=[],
+                errors=[],
+                resolved_links=[],
+            ),
+            [],
+        )
 
 
 class FakeVikingFS:
+    agfs = None
+
+    def __init__(self):
+        self.files = {}
+        self.writes = []
+
     async def read_file(self, uri, ctx=None):
-        assert uri == "viking://user/u/memories/trajectories/task_2026.md"
-        return (
-            "# task\nbody\n\n<!-- MEMORY_FIELDS\n"
-            '{"memory_type":"trajectories","trajectory_name":"task","outcome":"success",'
-            '"retrieval_anchor":"Stage: final"}\n-->'
-        )
+        return self.files[uri]
+
+    async def write_file(self, uri, content, ctx=None):
+        self.files[uri] = content
+        self.writes.append((uri, content, ctx))
 
 
 def _rollout() -> Rollout:
@@ -54,21 +72,47 @@ def _rollout() -> Rollout:
             input={},
             rubric=Rubric(name="r", description="d", criteria=[]),
         ),
-        messages=[Message(id="m", role="user", parts=[TextPart(text="hello")])],
+        messages=[
+            Message(
+                id="m",
+                role="user",
+                parts=[TextPart(text="hello")],
+                created_at="2026-06-07T12:00:00",
+            )
+        ],
         policy_snapshot_id="snapshot",
     )
 
 
 @pytest.mark.asyncio
-async def test_legacy_trajectory_rollout_analyzer_restricts_to_trajectory_phase():
-    compressor = FakeCompressor()
-    analyzer = LegacyTrajectoryRolloutAnalyzer(compressor=compressor, viking_fs=FakeVikingFS())
-    context = LegacyTrajectoryAnalyzerContext(request_context=SimpleNamespace())
+async def test_trajectory_rollout_analyzer_extracts_and_persists_trajectory(monkeypatch):
+    from openviking.session.train.components import trajectory_analyzer as module
+
+    FakeExtractLoop.created.clear()
+    fs = FakeVikingFS()
+    monkeypatch.setattr(module, "ExtractLoop", FakeExtractLoop)
+    monkeypatch.setattr(module, "get_viking_fs", lambda: fs)
+
+    analyzer = TrajectoryRolloutAnalyzer(viking_fs=fs, vlm=SimpleNamespace(model="fake"))
+    context = TrajectoryAnalyzerContext(
+        request_context=SimpleNamespace(
+            user=SimpleNamespace(account_id="default", user_id="u"),
+            account_id="default",
+        )
+    )
 
     analysis = await analyzer.analyze(_rollout(), context)
 
-    assert compressor.calls[0]["allowed_memory_types"] == {"trajectories"}
-    assert compressor.calls[0]["include_session_skills"] is False
+    assert FakeExtractLoop.created
+    created_loop = FakeExtractLoop.created[0]
+    assert created_loop._transaction_handle is None
+    provider = created_loop.kwargs["context_provider"]
+    assert provider._transaction_handle is None
+    assert [schema.memory_type for schema in provider.get_memory_schemas(context.request_context)] == [
+        "trajectories"
+    ]
+    assert len(fs.writes) == 1
+    assert fs.writes[0][0] == "viking://user/u/memories/trajectories/task_20260607120000.md"
     assert len(analysis.trajectories) == 1
     traj = analysis.trajectories[0]
     assert traj.name == "task"

@@ -87,16 +87,17 @@ class GroupingPolicyOptimizer:
 
         for target, target_gradients in groups.items():
             after_contents = {
-                gradient["patch"]["after_content"]
+                gradient["after_file"]["content"]
                 for gradient in target_gradients
-                if gradient.get("patch") and gradient["patch"].get("after_content") is not None
+                if gradient.get("after_file")
+                and gradient["after_file"].get("content") is not None
             }
             if len(target_gradients) > 1 and len(after_contents) > 1:
                 conflicts.append(
                     {
                         "target": target,
                         "gradient_count": len(target_gradients),
-                        "reason": "multiple patch gradients propose different after_content",
+                        "reason": "multiple patch gradients propose different after file content",
                     }
                 )
 
@@ -150,66 +151,37 @@ class MergeAwarePolicyOptimizer:
         if context is None or getattr(context, "request_context", None) is None:
             raise ValueError("MergeAwarePolicyOptimizerContext.request_context is required")
 
-        groups = _group_patch_gradients(gradients)
-        items: list[PolicyPlanItem] = []
-        merge_errors: list[dict[str, Any]] = []
-        skipped_groups: list[dict[str, Any]] = []
+        patch_gradients = [
+            gradient for gradient in gradients if getattr(gradient, "after_file", None) is not None
+        ]
+        if not patch_gradients:
+            return PolicyUpdatePlan(
+                items=[],
+                metadata={
+                    "optimizer": "merge_aware",
+                    "memory_type": self.memory_type,
+                    "gradient_count": len(gradients),
+                    "patch_gradient_count": 0,
+                },
+            )
 
-        fast_path_groups: list[dict[str, Any]] = []
-
-        for target, group_gradients in groups.items():
-            try:
-                fast_path_item = _single_clean_patch_fast_path_item(group_gradients, policy_set)
-                if fast_path_item is not None:
-                    items.append(fast_path_item)
-                    fast_path_groups.append(
-                        {
-                            "target": target,
-                            "reason": "single_clean_patch",
-                            "gradient_count": len(group_gradients),
-                        }
-                    )
-                    continue
-
-                operations = await self._run_merge_extract_loop(
-                    gradients=group_gradients,
-                    policy_set=policy_set,
-                    context=context,
-                    target=target,
-                )
-                group_items = _operations_to_plan_items(
-                    operations=operations,
-                    gradients=group_gradients,
-                    policy_set=policy_set,
-                    memory_type=self.memory_type,
-                )
-                _log_merge_output(
-                    target=target,
-                    operations=operations,
-                    plan_items=group_items,
-                    console=_merge_console_enabled(context),
-                )
-                if not group_items:
-                    skipped_groups.append(
-                        {
-                            "target": target,
-                            "reason": "merge_produced_no_plan_items",
-                            "gradient_count": len(group_gradients),
-                        }
-                    )
-                items.extend(group_items)
-            except Exception as exc:  # pragma: no cover - defensive adapter boundary
-                logger.exception("Policy patch merge failed for target %s", target)
-                error = {
-                    "target": target,
-                    "reason": "merge_failed",
-                    "error": str(exc),
-                    "gradient_count": len(group_gradients),
-                }
-                merge_errors.append(error)
-                skipped_groups.append(error)
-                if getattr(context, "strict_merge_errors", False):
-                    raise
+        operations = await self._run_merge_extract_loop(
+            gradients=patch_gradients,
+            policy_set=policy_set,
+            context=context,
+        )
+        items = _operations_to_plan_items(
+            operations=operations,
+            gradients=patch_gradients,
+            policy_set=policy_set,
+            memory_type=self.memory_type,
+        )
+        _log_merge_output(
+            target="all",
+            operations=operations,
+            plan_items=items,
+            console=False,
+        )
 
         return PolicyUpdatePlan(
             items=items,
@@ -217,21 +189,11 @@ class MergeAwarePolicyOptimizer:
                 "optimizer": "merge_aware",
                 "memory_type": self.memory_type,
                 "gradient_count": len(gradients),
-                "group_count": len(groups),
-                "groups": [
-                    {
-                        "target": target,
-                        "gradient_count": len(group_gradients),
-                        "gradients": [
-                            _gradient_to_dict(idx, gradient)
-                            for idx, gradient in enumerate(group_gradients)
-                        ],
-                    }
-                    for target, group_gradients in sorted(groups.items(), key=lambda item: item[0])
+                "patch_gradient_count": len(patch_gradients),
+                "gradients": [
+                    _gradient_to_dict(idx, gradient)
+                    for idx, gradient in enumerate(patch_gradients)
                 ],
-                "fast_path_groups": fast_path_groups,
-                "merge_errors": merge_errors,
-                "skipped_groups": skipped_groups,
             },
         )
 
@@ -246,7 +208,6 @@ class MergeAwarePolicyOptimizer:
         gradients: list[SemanticGradient],
         policy_set: ExperienceSet,
         context: MergeAwarePolicyOptimizerContext,
-        target: str | None = None,
     ):
         config = get_openviking_config()
         vlm = self.vlm or config.vlm.get_vlm_instance()
@@ -257,7 +218,7 @@ class MergeAwarePolicyOptimizer:
         extract_context = ExtractContext(list(context.messages or []))
         provider = PatchMergeContextProvider(
             memory_type=self.memory_type,
-            original_file_uris=_original_file_uris(gradients, policy_set),
+            required_file_uris=_required_file_uris(gradients, policy_set),
             patches=[_gradient_to_merge_patch(gradient) for gradient in gradients],
         )
         provider._ctx = context.request_context
@@ -276,11 +237,11 @@ class MergeAwarePolicyOptimizer:
         prefetch_messages = await provider.prefetch()
         provider.prefetch = _constant_prefetch(prefetch_messages)
         _log_merge_input(
-            target=target or "unknown",
+            target="all",
             provider=provider,
             gradients=gradients,
             prefetch_messages=prefetch_messages,
-            console=_merge_console_enabled(context),
+            console=False,
         )
 
         orchestrator = ExtractLoop(
@@ -294,18 +255,11 @@ class MergeAwarePolicyOptimizer:
         operations, _ = await orchestrator.run()
         return operations
 
-
-def _merge_console_enabled(context: Any) -> bool:
-    metadata = getattr(context, "metadata", {}) or {}
-    return bool(metadata.get("merge_trace_console", True))
-
-
 def _constant_prefetch(messages: list[dict[str, Any]]):
     async def prefetch() -> list[dict[str, Any]]:
         return list(messages)
 
     return prefetch
-
 
 def _log_merge_input(
     *,
@@ -319,11 +273,12 @@ def _log_merge_input(
         "\n========== MergeAwarePolicyOptimizer Input =========",
         f"target: {target}",
         f"memory_type: {provider.memory_type}",
-        f"original_file_uris: {provider.original_file_uris}",
+        f"required_file_uris: {provider.required_file_uris}",
         f"gradient_count: {len(gradients)}",
     ]
     for idx, gradient in enumerate(gradients):
-        patch = getattr(gradient, "patch", None)
+        before_file = getattr(gradient, "before_file", None)
+        after_file = getattr(gradient, "after_file", None)
         lines.extend(
             [
                 "",
@@ -336,14 +291,13 @@ def _log_merge_input(
                 f"rationale: {gradient.rationale}",
             ]
         )
-        if patch is not None:
+        if after_file is not None:
             lines.extend(
                 [
-                    "patch.before_content:",
-                    str(patch.before_content),
-                    "patch.after_content:",
-                    patch.after_content,
-                    f"patch.metadata: {dict(patch.metadata)}",
+                    "before_file:",
+                    _memory_file_summary(before_file),
+                    "after_file:",
+                    _memory_file_summary(after_file),
                 ]
             )
     lines.extend(["", "[Prefetch Messages]"])
@@ -353,7 +307,6 @@ def _log_merge_input(
         )
     lines.append("===================================================\n")
     tracer.info("\n".join(lines), console=console)
-
 
 def _log_merge_output(
     *,
@@ -390,7 +343,6 @@ def _log_merge_output(
     lines.append("====================================================\n")
     tracer.info("\n".join(lines), console=console)
 
-
 def _dump_model_or_value(value: Any) -> str:
     dumper = getattr(value, "model_dump_json", None)
     if dumper is not None:
@@ -400,6 +352,19 @@ def _dump_model_or_value(value: Any) -> str:
             return str(dumper())
     return str(value)
 
+def _memory_file_summary(file: MemoryFile | None) -> str:
+    if file is None:
+        return "None"
+    return _dump_model_or_value(
+        {
+            "uri": file.uri,
+            "memory_type": file.memory_type,
+            "content": file.content,
+            "links": file.links,
+            "backlinks": file.backlinks,
+            "extra_fields": file.extra_fields,
+        }
+    )
 
 def _gradient_to_dict(index: int, gradient: SemanticGradient) -> dict[str, Any]:
     result = {
@@ -412,63 +377,38 @@ def _gradient_to_dict(index: int, gradient: SemanticGradient) -> dict[str, Any]:
         "confidence": gradient.confidence,
         "metadata": dict(gradient.metadata),
     }
-    patch = getattr(gradient, "patch", None)
-    if patch is not None:
-        result["patch"] = {
-            "before_content": patch.before_content,
-            "after_content": patch.after_content,
-            "metadata": dict(patch.metadata),
-        }
+    before_file = getattr(gradient, "before_file", None)
+    after_file = getattr(gradient, "after_file", None)
+    if before_file is not None:
+        result["before_file"] = _memory_file_to_dict(before_file)
+    if after_file is not None:
+        result["after_file"] = _memory_file_to_dict(after_file)
     return result
 
-
-def _single_clean_patch_fast_path_item(
-    gradients: list[SemanticGradient],
-    policy_set: ExperienceSet,
-) -> PolicyPlanItem | None:
-    """Bypass LLM merge for one patch whose base matches the current policy."""
-
-    if len(gradients) != 1:
-        return None
-    gradient = gradients[0]
-    patch = getattr(gradient, "patch", None)
-    if patch is None:
-        return None
-    target_uri = gradient.target_experience_uri
-    if not target_uri:
-        return None
-    current = _find_policy_by_uri(policy_set, target_uri)
-    if current is None:
-        return None
-    if patch.before_content is None:
-        return None
-    if _normalize_policy_content(patch.before_content) != _normalize_policy_content(
-        current.content
-    ):
-        return None
-    item = _gradient_to_plan_item(gradient, policy_set)
-    if item is not None:
-        item.metadata["optimizer_fast_path"] = "single_clean_patch"
-    return item
-
-
-def _normalize_policy_content(content: str) -> str:
-    return content.strip()
-
+def _memory_file_to_dict(file: MemoryFile) -> dict[str, Any]:
+    return {
+        "uri": file.uri,
+        "memory_type": file.memory_type,
+        "content": file.content,
+        "links": list(file.links or []),
+        "backlinks": list(file.backlinks or []),
+        "extra_fields": dict(file.extra_fields or {}),
+    }
 
 def _gradient_to_plan_item(
     gradient: SemanticGradient,
     policy_set: ExperienceSet,
 ) -> PolicyPlanItem | None:
-    patch = getattr(gradient, "patch", None)
-    if patch is None:
+    after_file = getattr(gradient, "after_file", None)
+    if after_file is None:
         return None
+    before_file = getattr(gradient, "before_file", None)
     target_name = gradient.target_experience_name
     target_uri = gradient.target_experience_uri
-    before_content = patch.before_content
+    before_content = before_file.plain_content() if before_file is not None else None
     policy_uris = {policy.uri for policy in policy_set.policies}
     if target_uri and target_uri not in policy_uris:
-        superseded = _find_superseded_policy(patch.metadata.get("supersedes"), policy_set)
+        superseded = _find_superseded_policy(_gradient_supersedes(gradient), policy_set)
         if superseded is not None:
             target_name = superseded.name
             target_uri = superseded.uri
@@ -479,49 +419,45 @@ def _gradient_to_plan_item(
         target_experience_name=target_name,
         target_experience_uri=target_uri,
         before_content=before_content,
-        after_content=patch.after_content,
+        after_content=after_file.plain_content(),
         base_version=gradient.base_version,
         confidence=gradient.confidence,
         evidence_trajectory_uris=list(gradient.evidence_trajectory_uris),
         metadata={
             "rationale": gradient.rationale,
             "gradient_metadata": dict(gradient.metadata),
-            "patch_metadata": dict(patch.metadata),
+            "after_file_metadata": dict(after_file.extra_fields or {}),
         },
     )
 
-
-def _group_patch_gradients(gradients: list[SemanticGradient]) -> dict[str, list[SemanticGradient]]:
-    groups: dict[str, list[SemanticGradient]] = defaultdict(list)
-    for gradient in gradients:
-        if getattr(gradient, "patch", None) is None:
-            continue
-        key = gradient.target_experience_uri or f"new:{gradient.target_experience_name}"
-        groups[key].append(gradient)
-    return groups
-
-
 def _gradient_to_merge_patch(gradient: SemanticGradient) -> PatchMergePatch:
-    patch = getattr(gradient, "patch", None)
-    if patch is None:
-        raise ValueError(f"SemanticGradient has no patch: {gradient.target_experience_name}")
+    after_file = getattr(gradient, "after_file", None)
+    if after_file is None:
+        raise ValueError(f"SemanticGradient has no after_file: {gradient.target_experience_name}")
     return PatchMergePatch(
-        target_name=gradient.target_experience_name,
-        target_uri=gradient.target_experience_uri,
-        before_content=patch.before_content,
-        after_content=patch.after_content,
+        before_file=getattr(gradient, "before_file", None),
+        after_file=after_file,
         metadata={
             "base_version": gradient.base_version,
             "rationale": gradient.rationale,
             "evidence_trajectory_uris": list(gradient.evidence_trajectory_uris),
             "confidence": gradient.confidence,
-            "gradient_metadata": dict(gradient.metadata),
-            "patch_metadata": dict(patch.metadata),
+            "gradient_metadata": _compact_gradient_metadata(gradient.metadata),
         },
     )
 
 
-def _original_file_uris(
+def _compact_gradient_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
+    compact = dict(metadata)
+    memory_fields = compact.get("memory_fields")
+    if isinstance(memory_fields, dict) and "content" in memory_fields:
+        compact["memory_fields"] = {
+            key: value for key, value in memory_fields.items() if key != "content"
+        }
+    return compact
+
+
+def _required_file_uris(
     gradients: list[SemanticGradient],
     policy_set: ExperienceSet,
 ) -> list[str]:
@@ -529,15 +465,11 @@ def _original_file_uris(
     for gradient in gradients:
         uri = gradient.target_experience_uri
         if not uri:
-            superseded = _find_superseded_policy(
-                getattr(getattr(gradient, "patch", None), "metadata", {}).get("supersedes"),
-                policy_set,
-            )
+            superseded = _find_superseded_policy(_gradient_supersedes(gradient), policy_set)
             uri = superseded.uri if superseded is not None else None
         if uri and uri not in uris:
             uris.append(uri)
     return uris
-
 
 def _seed_read_file_contents(
     provider: PatchMergeContextProvider,
@@ -545,24 +477,15 @@ def _seed_read_file_contents(
     policy_set: ExperienceSet,
 ) -> None:
     for policy in policy_set.policies:
-        if policy.uri in provider.original_file_uris:
+        if policy.uri in provider.required_file_uris:
             provider.read_file_contents[policy.uri] = _experience_to_memory_file(policy)
     for gradient in gradients:
-        patch = getattr(gradient, "patch", None)
-        if patch is None or gradient.target_experience_uri in provider.read_file_contents:
+        before_file = getattr(gradient, "before_file", None)
+        target_uri = gradient.target_experience_uri
+        if before_file is None or target_uri in provider.read_file_contents:
             continue
-        if gradient.target_experience_uri and patch.before_content is not None:
-            provider.read_file_contents[gradient.target_experience_uri] = MemoryFile(
-                uri=gradient.target_experience_uri,
-                content=patch.before_content,
-                memory_type="experiences",
-                extra_fields={
-                    "experience_name": gradient.target_experience_name,
-                    "version": gradient.base_version or 1,
-                    "status": "production",
-                },
-            )
-
+        if target_uri:
+            provider.read_file_contents[target_uri] = before_file
 
 def _experience_to_memory_file(experience: Experience) -> MemoryFile:
     return MemoryFile(
@@ -577,7 +500,6 @@ def _experience_to_memory_file(experience: Experience) -> MemoryFile:
             "status": experience.status,
         },
     )
-
 
 def _operations_to_plan_items(
     *,
@@ -652,13 +574,11 @@ def _operations_to_plan_items(
         )
     return items
 
-
 def _find_policy_by_uri(policy_set: ExperienceSet, uri: str) -> Experience | None:
     for policy in policy_set.policies:
         if policy.uri == uri:
             return policy
     return None
-
 
 def _base_version_from_old_file_or_policy(
     old_file: Any, target_uri: str | None, policy_set: ExperienceSet
@@ -672,7 +592,6 @@ def _base_version_from_old_file_or_policy(
         return policy.version if policy is not None else None
     return None
 
-
 def _safe_int(value: Any) -> int | None:
     try:
         parsed = int(value)
@@ -680,17 +599,23 @@ def _safe_int(value: Any) -> int | None:
         return None
     return parsed if parsed > 0 else None
 
-
 def _first_uri(uris: list[str]) -> str | None:
     return uris[0] if uris else None
 
+def _gradient_supersedes(gradient: SemanticGradient) -> Any:
+    metadata = dict(getattr(gradient, "metadata", {}) or {})
+    if metadata.get("supersedes") is not None:
+        return metadata.get("supersedes")
+    after_file = getattr(gradient, "after_file", None)
+    if after_file is not None:
+        return (after_file.extra_fields or {}).get("supersedes")
+    return None
 
 def _fallback_experience_name(op: Any) -> str:
     uri = _first_uri(getattr(op, "uris", []) or [])
     if uri:
         return uri.rstrip("/").split("/")[-1].removesuffix(".md")
     return "unknown_experience"
-
 
 def _find_superseded_policy(supersedes: Any, policy_set: ExperienceSet):
     names: list[str]

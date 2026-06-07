@@ -11,23 +11,23 @@ from openviking.session.memory.dataclass import MemoryFile
 from openviking.session.train import (
     CriterionResult,
     Experience,
+    ExperienceGradientContext,
+    ExperienceGradientEstimator,
     ExperienceSet,
-    LegacyExperienceGradientContext,
-    LegacyExperienceGradientEstimator,
     RolloutAnalysis,
     RubricEvaluation,
     Trajectory,
 )
-from openviking.session.train.adapters import gradient_estimator as gradient_estimator_module
+from openviking.session.train.components import gradient_estimator as gradient_estimator_module
 
 
-class FakeLegacyExperienceGradientEstimator(LegacyExperienceGradientEstimator):
+class FakeExperienceGradientEstimator(ExperienceGradientEstimator):
     def __init__(self, operations_by_trajectory_uri):
         super().__init__()
         self.operations_by_trajectory_uri = operations_by_trajectory_uri
         self.calls = []
 
-    async def _run_legacy_extract_loop(self, trajectory, context):
+    async def _run_extract_loop(self, trajectory, context):
         self.calls.append((trajectory, context))
         return self.operations_by_trajectory_uri.get(trajectory.uri)
 
@@ -75,12 +75,12 @@ def _experience_set() -> ExperienceSet:
     )
 
 
-def _context() -> LegacyExperienceGradientContext:
-    return LegacyExperienceGradientContext(request_context=SimpleNamespace(), messages=[])
+def _context() -> ExperienceGradientContext:
+    return ExperienceGradientContext(request_context=SimpleNamespace(), messages=[])
 
 
 @pytest.mark.asyncio
-async def test_legacy_experience_gradient_estimator_converts_experience_operations():
+async def test_experience_gradient_estimator_converts_experience_operations():
     analysis = _analysis(passed=True, outcome="success")
     old_file = MemoryFile(
         uri="viking://user/u/memories/experiences/booking_duplicate_handling.md",
@@ -108,7 +108,7 @@ async def test_legacy_experience_gradient_estimator_converts_experience_operatio
             ),
         ]
     )
-    estimator = FakeLegacyExperienceGradientEstimator({analysis.trajectories[0].uri: operations})
+    estimator = FakeExperienceGradientEstimator({analysis.trajectories[0].uri: operations})
 
     gradients = await estimator.estimate(analysis, _experience_set(), _context())
 
@@ -119,9 +119,10 @@ async def test_legacy_experience_gradient_estimator_converts_experience_operatio
         "viking://user/u/memories/experiences/booking_duplicate_handling.md"
     )
     assert gradient.base_version == 7
-    assert gradient.patch.before_content == "old body with [[links]]"
-    assert gradient.patch.after_content == "new body"
-    assert gradient.patch.metadata == {"supersedes": ["older_experience"]}
+    assert gradient.before_file is old_file
+    assert gradient.after_file.content == "new body"
+    assert gradient.after_file.extra_fields["supersedes"] == ["older_experience"]
+    assert gradient.metadata["supersedes"] == ["older_experience"]
     assert gradient.evidence_trajectory_uris == [analysis.trajectories[0].uri]
     assert gradient.confidence == pytest.approx(0.9)
     assert gradient.metadata["trajectory_outcome"] == "success"
@@ -130,7 +131,7 @@ async def test_legacy_experience_gradient_estimator_converts_experience_operatio
 
 
 @pytest.mark.asyncio
-async def test_legacy_experience_gradient_estimator_uses_policy_version_for_newer_old_file_absence():
+async def test_experience_gradient_estimator_uses_policy_version_for_newer_old_file_absence():
     analysis = _analysis(passed=False, outcome="failure")
     operations = SimpleNamespace(
         upsert_operations=[
@@ -142,7 +143,7 @@ async def test_legacy_experience_gradient_estimator_uses_policy_version_for_newe
             )
         ]
     )
-    estimator = FakeLegacyExperienceGradientEstimator({analysis.trajectories[0].uri: operations})
+    estimator = FakeExperienceGradientEstimator({analysis.trajectories[0].uri: operations})
 
     gradients = await estimator.estimate(analysis, _experience_set(), _context())
 
@@ -150,34 +151,34 @@ async def test_legacy_experience_gradient_estimator_uses_policy_version_for_newe
     gradient = gradients[0]
     assert gradient.target_experience_name == "booking_duplicate_handling"
     assert gradient.base_version == 3
-    assert gradient.patch.before_content is None
-    assert gradient.patch.after_content == "replacement body"
+    assert gradient.before_file is None
+    assert gradient.after_file.content == "replacement body"
     assert gradient.confidence == pytest.approx(0.3)
 
 
 @pytest.mark.asyncio
-async def test_legacy_experience_gradient_estimator_skips_empty_content_and_handles_extract_errors():
+async def test_experience_gradient_estimator_skips_empty_content_and_handles_extract_errors():
     analysis = _analysis()
-    estimator = FakeLegacyExperienceGradientEstimator({})
+    estimator = FakeExperienceGradientEstimator({})
 
     async def raise_error(_trajectory, _context):
-        raise RuntimeError("legacy failure")
+        raise RuntimeError("extract failure")
 
-    estimator._run_legacy_extract_loop = raise_error
+    estimator._run_extract_loop = raise_error
 
     assert await estimator.estimate(analysis, _experience_set(), _context()) == []
 
-    strict_context = LegacyExperienceGradientContext(
+    strict_context = ExperienceGradientContext(
         request_context=SimpleNamespace(),
         messages=[],
         strict_extract_errors=True,
     )
-    with pytest.raises(RuntimeError, match="legacy failure"):
+    with pytest.raises(RuntimeError, match="extract failure"):
         await estimator.estimate(analysis, _experience_set(), strict_context)
 
 
 @pytest.mark.asyncio
-async def test_legacy_experience_gradient_estimator_reuses_legacy_extract_loop(monkeypatch):
+async def test_experience_gradient_estimator_runs_extract_loop(monkeypatch):
     analysis = _analysis()
     captured = {}
 
@@ -205,7 +206,7 @@ async def test_legacy_experience_gradient_estimator_reuses_legacy_extract_loop(m
     monkeypatch.setattr(gradient_estimator_module, "MemoryIsolationHandler", FakeIsolationHandler)
     monkeypatch.setattr(gradient_estimator_module, "ExtractLoop", FakeExtractLoop)
 
-    estimator = LegacyExperienceGradientEstimator(
+    estimator = ExperienceGradientEstimator(
         viking_fs=SimpleNamespace(), vlm=SimpleNamespace()
     )
     context = _context()
