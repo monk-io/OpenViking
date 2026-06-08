@@ -448,12 +448,18 @@ def _print_real_llm_e2e_summary(
     tracer.info("\n".join(lines), console=True)
 
 
-def _print_iterative_real_llm_summary(*, result, fs: InMemoryVikingFS, experience_uri: str) -> None:
+def _print_iterative_real_llm_summary(
+    *,
+    result,
+    final_evaluation,
+    fs: InMemoryVikingFS,
+    experience_uri: str,
+) -> None:
     lines = [
         "\n========== Real LLM Iterative Policy Optimization =========",
         f"[TraceID] {tracer.get_trace_id()}",
         f"iterations: {len(result.iterations)}",
-        f"final_evaluation_passes: {len(result.evaluation_passes)}",
+        f"final_evaluation_score: {final_evaluation.metadata.get('score')}",
         f"first_score: {result.metadata.get('first_score')}",
         f"final_score: {result.metadata.get('final_score')}",
         f"score_delta: {result.metadata.get('score_delta')}",
@@ -502,28 +508,27 @@ def _print_iterative_real_llm_summary(*, result, fs: InMemoryVikingFS, experienc
                     assistant_text,
                 ]
             )
-    for evaluation in result.evaluation_passes:
+    lines.extend(
+        [
+            "",
+            f"[Final Evaluation {final_evaluation.iteration}]",
+            f"score: {final_evaluation.metadata.get('score')}",
+            f"snapshot_ids: {final_evaluation.policy_snapshot_ids}",
+        ]
+    )
+    for analysis in final_evaluation.analyses:
+        messages = analysis.metadata.get("rollout_messages", [])
+        assistant_text = "\n".join(
+            message.content for message in messages if message.role == "assistant"
+        )
         lines.extend(
             [
-                "",
-                f"[Final Evaluation {evaluation.iteration}]",
-                f"score: {evaluation.metadata.get('score')}",
-                f"snapshot_ids: {evaluation.policy_snapshot_ids}",
+                f"passed: {analysis.evaluation.passed}",
+                f"feedback: {'; '.join(analysis.evaluation.feedback)}",
+                "assistant:",
+                assistant_text,
             ]
         )
-        for analysis in evaluation.analyses:
-            messages = analysis.metadata.get("rollout_messages", [])
-            assistant_text = "\n".join(
-                message.content for message in messages if message.role == "assistant"
-            )
-            lines.extend(
-                [
-                    f"passed: {analysis.evaluation.passed}",
-                    f"feedback: {'; '.join(analysis.evaluation.feedback)}",
-                    "assistant:",
-                    assistant_text,
-                ]
-            )
     lines.extend(["", "[Updated Experience File]", fs.files.get(experience_uri, "")])
     lines.append("==========================================================\n")
     tracer.info("\n".join(lines), console=True)
@@ -631,7 +636,7 @@ async def _run_policy_optimization_pipeline_real_config_llm_e2e_writes_updated_e
         policy_updater=MemoryFilePolicyUpdater(viking_fs=fs),
     )
 
-    result = await pipeline.run(
+    result = await pipeline.train(
         case_loader=ListCaseLoader([_case()]),
         policy_set=policy_set,
         context=PipelineContext(
@@ -643,7 +648,14 @@ async def _run_policy_optimization_pipeline_real_config_llm_e2e_writes_updated_e
             optimization_context=PatchMergePolicyOptimizerContext(request_context=request_context),
             apply_context=request_context,
             max_iterations=4,
-            final_evaluation=True,
+        ),
+    )
+    final_evaluation = await pipeline.eval(
+        case_loader=ListCaseLoader([_case()]),
+        policy_set=result.apply_result.updated_policy_set,
+        context=PipelineContext(
+            analysis_context=TrajectoryAnalyzerContext(request_context=request_context),
+            execution_metadata={"iteration": 4},
         ),
     )
 
@@ -651,7 +663,12 @@ async def _run_policy_optimization_pipeline_real_config_llm_e2e_writes_updated_e
     assistant_text = rollout_messages[1].content
     trajectory_content = result.analyses[0].trajectories[0].content
     gradient = result.gradients[0]
-    _print_iterative_real_llm_summary(result=result, fs=fs, experience_uri=experience_uri)
+    _print_iterative_real_llm_summary(
+        result=result,
+        final_evaluation=final_evaluation,
+        fs=fs,
+        experience_uri=experience_uri,
+    )
     assert assistant_text.strip()
     assert trajectory_content.strip()
     assert gradient.after_file.plain_content().strip()
@@ -665,9 +682,8 @@ async def _run_policy_optimization_pipeline_real_config_llm_e2e_writes_updated_e
         iteration.plan.metadata.get("optimizer") == "patch_merge" for iteration in result.iterations
     )
     assert len(result.iterations) == 4
-    assert len(result.evaluation_passes) == 1
-    assert result.metadata["final_score"] > result.metadata["first_score"]
-    assert result.evaluation_passes[0].metadata["score"] == result.metadata["final_score"]
+    assert result.evaluation_passes == []
+    assert final_evaluation.metadata["score"] > result.metadata["first_score"]
     assert result.metadata["score_delta"] > 0
     assert len({iteration.metadata["score"] for iteration in result.iterations}) >= 3
     assert "重复" in fs.files[experience_uri]

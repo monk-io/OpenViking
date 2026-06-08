@@ -12,12 +12,14 @@ from openviking.session.train.context import ExecutionContext
 from openviking.session.train.domain import (
     Case,
     ExperienceSet,
+    PipelineEvaluationResult,
     PipelineResult,
     PolicyApplyResult,
     PolicyUpdatePlan,
     Rollout,
     RolloutAnalysis,
     RolloutTrainingResult,
+    RubricEvaluation,
 )
 
 
@@ -103,6 +105,12 @@ class RolloutAnalyzer(Protocol):
     async def analyze(self, rollout: Rollout, context: Any) -> RolloutAnalysis: ...
 
 
+class RolloutEvaluator(Protocol):
+    """Evaluates a rollout before learning-signal extraction."""
+
+    async def evaluate(self, rollout: Rollout, context: Any) -> RubricEvaluation: ...
+
+
 class GradientEstimator(Protocol):
     """Estimates semantic gradients from rollout analysis."""
 
@@ -117,12 +125,19 @@ class GradientEstimator(Protocol):
 class PolicyOptimizationPipeline(Protocol):
     """Runs end-to-end policy optimization over case batches."""
 
-    async def run(
+    async def train(
         self,
         case_loader: CaseLoader,
         policy_set: ExperienceSet,
         context: Any,
     ) -> PipelineResult: ...
+
+    async def eval(
+        self,
+        case_loader: CaseLoader,
+        policy_set: ExperienceSet,
+        context: Any,
+    ) -> PipelineEvaluationResult: ...
 
     async def train_from_rollouts(
         self,

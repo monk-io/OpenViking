@@ -9,7 +9,13 @@ import pytest
 
 from openviking.message import Message, TextPart
 from openviking.session.memory.dataclass import ResolvedOperation, ResolvedOperations
-from openviking.session.train import Case, Rollout, Rubric
+from openviking.session.train import (
+    Case,
+    CriterionResult,
+    Rollout,
+    Rubric,
+    RubricEvaluation,
+)
 from openviking.session.train.components.trajectory_analyzer import (
     TrajectoryAnalyzerContext,
     TrajectoryRolloutAnalyzer,
@@ -62,6 +68,29 @@ class FakeVikingFS:
     async def write_file(self, uri, content, ctx=None):
         self.files[uri] = content
         self.writes.append((uri, content, ctx))
+
+
+class FakeRolloutEvaluator:
+    def __init__(self):
+        self.calls = []
+
+    async def evaluate(self, rollout, context):
+        self.calls.append((rollout, context))
+        return RubricEvaluation(
+            passed=False,
+            score=0.25,
+            criterion_results=[
+                CriterionResult(
+                    criterion_name="tau2_reward",
+                    passed=False,
+                    score=0.0,
+                    feedback=["reward was zero"],
+                    evidence=["missing confirmation"],
+                )
+            ],
+            feedback=["task failed"],
+            metadata={"source": "fake"},
+        )
 
 
 def _rollout() -> Rollout:
@@ -120,3 +149,46 @@ async def test_trajectory_rollout_analyzer_extracts_and_persists_trajectory(monk
     assert traj.retrieval_anchor == "Stage: final"
     assert analysis.evaluation.passed is True
     assert analysis.metadata["policy_snapshot_id"] == "snapshot"
+
+
+@pytest.mark.asyncio
+async def test_trajectory_rollout_analyzer_evaluates_before_extracting_trajectory(monkeypatch):
+    from openviking.session.train.components import trajectory_analyzer as module
+
+    FakeExtractLoop.created.clear()
+    fs = FakeVikingFS()
+    evaluator = FakeRolloutEvaluator()
+    evaluator_context = {"benchmark": "tau2"}
+    monkeypatch.setattr(module, "ExtractLoop", FakeExtractLoop)
+    monkeypatch.setattr(module, "get_viking_fs", lambda: fs)
+
+    analyzer = TrajectoryRolloutAnalyzer(
+        viking_fs=fs,
+        vlm=SimpleNamespace(model="fake"),
+        evaluator=evaluator,
+    )
+    context = TrajectoryAnalyzerContext(
+        request_context=SimpleNamespace(
+            user=SimpleNamespace(account_id="default", user_id="u"),
+            account_id="default",
+        ),
+        evaluator_context=evaluator_context,
+    )
+
+    rollout = _rollout()
+    analysis = await analyzer.analyze(rollout, context)
+
+    assert evaluator.calls == [(rollout, evaluator_context)]
+    assert analysis.evaluation.score == 0.25
+    assert analysis.evaluation.metadata == {"source": "fake"}
+    created_loop = FakeExtractLoop.created[0]
+    provider = created_loop.kwargs["context_provider"]
+    assert len(provider.messages) == 2
+    assert provider.messages[0] is rollout.messages[0]
+    feedback_message = provider.messages[1]
+    assert feedback_message.role == "user"
+    assert "[Rollout Evaluation]" in feedback_message.content
+    assert "score: 0.25" in feedback_message.content
+    assert "task failed" in feedback_message.content
+    assert "missing confirmation" in feedback_message.content
+    assert analysis.metadata["extraction_message_count"] == 2

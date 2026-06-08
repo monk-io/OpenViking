@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from openviking.core.context import Context
-from openviking.message import Message
+from openviking.message import Message, TextPart
 from openviking.server.identity import RequestContext
 from openviking.session.memory import ExtractLoop, MemoryUpdater
 from openviking.session.memory.agent_trajectory_context_provider import (
@@ -25,6 +25,7 @@ from openviking.session.train.domain import (
     RubricEvaluation,
     Trajectory,
 )
+from openviking.session.train.interfaces import RolloutEvaluator
 from openviking.storage.viking_fs import get_viking_fs
 from openviking.telemetry import tracer
 from openviking_cli.utils import get_logger
@@ -42,6 +43,8 @@ class TrajectoryAnalyzerContext:
     request_context: RequestContext
     strict_extract_errors: bool = False
     latest_archive_overview: str = ""
+    evaluator_context: Any = None
+    inject_evaluation_feedback: bool = True
 
 
 @dataclass(slots=True)
@@ -56,6 +59,7 @@ class TrajectoryRolloutAnalyzer:
     viking_fs: Any = None
     vikingdb: Any = None
     vlm: Any = None
+    evaluator: RolloutEvaluator | None = None
 
     @tracer("train.rollout_analyzer.trajectory.analyze", ignore_result=True, ignore_args=True)
     async def analyze(
@@ -66,8 +70,14 @@ class TrajectoryRolloutAnalyzer:
         if context is None or context.request_context is None:
             raise ValueError("TrajectoryAnalyzerContext.request_context is required")
 
+        evaluation = await self._evaluate_rollout(rollout, context)
+        extraction_messages = _messages_with_evaluation_feedback(
+            rollout.messages,
+            evaluation=evaluation,
+            enabled=evaluation is not None and context.inject_evaluation_feedback,
+        )
         result = await self.extract_trajectory_memories(
-            messages=rollout.messages,
+            messages=extraction_messages,
             ctx=context.request_context,
             strict_extract_errors=context.strict_extract_errors,
             latest_archive_overview=context.latest_archive_overview,
@@ -84,15 +94,26 @@ class TrajectoryRolloutAnalyzer:
             trajectory_uris,
             ctx=context.request_context,
         )
+        evaluation = evaluation or _evaluation_from_trajectories(trajectories)
         return RolloutAnalysis(
-            evaluation=_evaluation_from_trajectories(trajectories),
+            evaluation=evaluation,
             trajectories=trajectories,
             metadata={
                 "context_count": len(contexts),
                 "policy_snapshot_id": rollout.policy_snapshot_id,
                 "rollout_messages": rollout.messages,
+                "extraction_message_count": len(extraction_messages),
             },
         )
+
+    async def _evaluate_rollout(
+        self,
+        rollout: Rollout,
+        context: TrajectoryAnalyzerContext,
+    ) -> RubricEvaluation | None:
+        if self.evaluator is None:
+            return None
+        return await self.evaluator.evaluate(rollout, context.evaluator_context)
 
     async def extract_trajectory_memories(
         self,
@@ -289,4 +310,45 @@ def _evaluation_from_trajectories(trajectories: list[Trajectory]) -> RubricEvalu
         ],
         feedback=[] if passed else ["No trajectory was extracted from the rollout."],
         metadata={"trajectory_count": len(trajectories)},
+    )
+
+
+def _messages_with_evaluation_feedback(
+    messages: list[Message],
+    *,
+    evaluation: RubricEvaluation | None,
+    enabled: bool,
+) -> list[Message]:
+    result = list(messages)
+    if not enabled or evaluation is None:
+        return result
+    result.append(_evaluation_feedback_message(evaluation))
+    return result
+
+
+def _evaluation_feedback_message(evaluation: RubricEvaluation) -> Message:
+    lines = [
+        "[Rollout Evaluation]",
+        f"passed: {evaluation.passed}",
+        f"score: {evaluation.score}",
+    ]
+    if evaluation.feedback:
+        lines.extend(["", "feedback:", *[f"- {item}" for item in evaluation.feedback]])
+    criterion_lines: list[str] = []
+    evidence_lines: list[str] = []
+    for criterion in evaluation.criterion_results:
+        criterion_lines.append(
+            f"- {criterion.criterion_name}: "
+            f"passed={criterion.passed}, score={criterion.score}"
+        )
+        criterion_lines.extend(f"  feedback: {item}" for item in criterion.feedback)
+        evidence_lines.extend(criterion.evidence)
+    if criterion_lines:
+        lines.extend(["", "criteria:", *criterion_lines])
+    if evidence_lines:
+        lines.extend(["", "evidence:", *[f"- {item}" for item in dict.fromkeys(evidence_lines)]])
+    return Message(
+        id="rollout-evaluation-feedback",
+        role="user",
+        parts=[TextPart(text="\n".join(lines))],
     )

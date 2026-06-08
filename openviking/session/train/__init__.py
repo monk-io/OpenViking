@@ -51,6 +51,7 @@ from openviking.session.train.interfaces import (
     PolicySnapshotter,
     PolicyUpdater,
     RolloutAnalyzer,
+    RolloutEvaluator,
     RolloutExecutor,
     SemanticGradient,
 )
@@ -116,6 +117,7 @@ __all__ = [
     "RolloutAnalysis",
     "RolloutAnalyzer",
     "RolloutExecutor",
+    "RolloutEvaluator",
     "RolloutTrainingResult",
     "Rubric",
     "RubricCriterion",

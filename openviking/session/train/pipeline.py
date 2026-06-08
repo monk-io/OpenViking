@@ -33,19 +33,16 @@ from openviking.telemetry import tracer
 
 
 class OfflinePolicyOptimizationPipeline:
-    """Composable batch-oriented iterative policy optimization pipeline.
+    """Composable offline train/eval pipeline for case-driven policy optimization.
 
     This class wires the protocol interfaces together.  It does not implement
     rollout execution, LLM analysis, gradient estimation, optimization, or file
     updates itself.
 
-    ``run`` natively supports multiple offline iterations.  Each iteration uses
-    the current policy set to run rollouts and evaluations, then applies the
-    resulting update before the next iteration.  With ``final_evaluation=True``
-    the pipeline also runs one evaluation-only pass after the last update, which
-    gives callers the canonical before/after sequence:
-
-    ``rollout -> evaluate -> train -> rollout -> evaluate``.
+    ``train`` updates the policy set from case rollouts. ``eval`` only executes
+    and analyzes rollouts; it never estimates gradients or writes policy files.
+    Benchmark runners should explicitly compose them, for example:
+    ``eval(test) -> train(train) -> eval(test)``.
     """
 
     def __init__(
@@ -71,8 +68,8 @@ class OfflinePolicyOptimizationPipeline:
             policy_updater=policy_updater,
         )
 
-    @tracer("train.pipeline.run", ignore_result=True, ignore_args=True)
-    async def run(
+    @tracer("train.pipeline.train", ignore_result=True, ignore_args=True)
+    async def train(
         self,
         case_loader: CaseLoader,
         policy_set: ExperienceSet,
@@ -82,7 +79,6 @@ class OfflinePolicyOptimizationPipeline:
         max_iterations = max(1, int(ctx.max_iterations or 1))
         current_policy_set = policy_set
         iteration_results: list[PipelineIterationResult] = []
-        evaluation_passes: list[PipelineEvaluationResult] = []
 
         for iteration in range(max_iterations):
             iteration_result = await self._run_training_iteration(
@@ -93,16 +89,6 @@ class OfflinePolicyOptimizationPipeline:
             )
             iteration_results.append(iteration_result)
             current_policy_set = iteration_result.apply_result.updated_policy_set
-
-        if ctx.final_evaluation:
-            evaluation_passes.append(
-                await self._run_evaluation_pass(
-                    iteration=max_iterations,
-                    case_loader=case_loader,
-                    policy_set=current_policy_set,
-                    ctx=ctx,
-                )
-            )
 
         all_analyses = [
             analysis for iteration in iteration_results for analysis in iteration.analyses
@@ -119,11 +105,10 @@ class OfflinePolicyOptimizationPipeline:
             last_apply_result = PolicyApplyResult(updated_policy_set=current_policy_set)
 
         first_score = _first_analysis_score(iteration_results)
-        final_score = _final_analysis_score(iteration_results, evaluation_passes)
+        final_score = _final_analysis_score(iteration_results)
         metadata: dict[str, Any] = {
             "policy_set_root_uri": current_policy_set.root_uri,
             "max_iterations": max_iterations,
-            "final_evaluation": ctx.final_evaluation,
         }
         if first_score is not None:
             metadata["first_score"] = first_score
@@ -138,8 +123,23 @@ class OfflinePolicyOptimizationPipeline:
             plan=last_plan,
             apply_result=last_apply_result,
             iterations=iteration_results,
-            evaluation_passes=evaluation_passes,
+            evaluation_passes=[],
             metadata=metadata,
+        )
+
+    @tracer("train.pipeline.eval", ignore_result=True, ignore_args=True)
+    async def eval(
+        self,
+        case_loader: CaseLoader,
+        policy_set: ExperienceSet,
+        context: PipelineContext | Any,
+    ) -> PipelineEvaluationResult:
+        ctx = context if isinstance(context, PipelineContext) else PipelineContext()
+        return await self._run_evaluation_pass(
+            iteration=int(ctx.execution_metadata.get("iteration", 0) or 0),
+            case_loader=case_loader,
+            policy_set=policy_set,
+            ctx=ctx,
         )
 
     @tracer("train.pipeline.train_from_rollouts", ignore_result=True, ignore_args=True)
@@ -313,12 +313,7 @@ def _first_analysis_score(iterations: list[PipelineIterationResult]) -> float | 
 
 def _final_analysis_score(
     iterations: list[PipelineIterationResult],
-    evaluation_passes: list[PipelineEvaluationResult],
 ) -> float | None:
-    for evaluation in reversed(evaluation_passes):
-        score = _average_score(evaluation.analyses)
-        if score is not None:
-            return score
     for iteration in reversed(iterations):
         score = _average_score(iteration.analyses)
         if score is not None:

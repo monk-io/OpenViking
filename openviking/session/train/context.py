@@ -24,7 +24,6 @@ class PipelineContext:
     apply_context: Any = None
     execution_metadata: dict[str, Any] = field(default_factory=dict)
     max_iterations: int = 1
-    final_evaluation: bool = False
 
 
 @dataclass(slots=True)

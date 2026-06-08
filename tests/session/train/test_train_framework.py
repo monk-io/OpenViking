@@ -251,7 +251,7 @@ async def test_default_policy_optimization_pipeline_runs_one_batch():
     )
 
     initial_policy_set = _policy_set()
-    result = await pipeline.run(
+    result = await pipeline.train(
         case_loader=ListCaseLoader([_case()]),
         policy_set=initial_policy_set,
         context=PipelineContext(),
@@ -271,7 +271,7 @@ async def test_default_policy_optimization_pipeline_runs_one_batch():
 
 
 @pytest.mark.asyncio
-async def test_default_policy_optimization_pipeline_supports_multiple_iterations_and_final_eval():
+async def test_offline_policy_optimization_pipeline_supports_train_and_eval():
     snapshotter = DummySnapshotter()
     pipeline = OfflinePolicyOptimizationPipeline(
         snapshotter=snapshotter,
@@ -281,22 +281,35 @@ async def test_default_policy_optimization_pipeline_supports_multiple_iterations
         policy_optimizer=DummyOptimizer(),
         policy_updater=DummyUpdater(),
     )
+    policy_set = _policy_set()
 
-    result = await pipeline.run(
+    before_eval = await pipeline.eval(
         case_loader=ListCaseLoader([_case()]),
-        policy_set=_policy_set(),
-        context=PipelineContext(max_iterations=2, final_evaluation=True),
+        policy_set=policy_set,
+        context=PipelineContext(execution_metadata={"iteration": -1}),
+    )
+    result = await pipeline.train(
+        case_loader=ListCaseLoader([_case()]),
+        policy_set=policy_set,
+        context=PipelineContext(max_iterations=2),
+    )
+    after_eval = await pipeline.eval(
+        case_loader=ListCaseLoader([_case()]),
+        policy_set=result.apply_result.updated_policy_set,
+        context=PipelineContext(execution_metadata={"iteration": 2}),
     )
 
+    assert before_eval.iteration == -1
+    assert before_eval.metadata["score"] == 0.0
     assert [item.iteration for item in result.iterations] == [0, 1]
-    assert len(result.evaluation_passes) == 1
-    assert result.evaluation_passes[0].iteration == 2
-    assert result.iterations[0].metadata["score"] == 0.0
-    assert result.iterations[1].metadata["score"] == 1.0
-    assert result.evaluation_passes[0].metadata["score"] == 2.0
-    assert result.metadata["first_score"] == 0.0
+    assert result.evaluation_passes == []
+    assert result.iterations[0].metadata["score"] == 1.0
+    assert result.iterations[1].metadata["score"] == 2.0
+    assert after_eval.iteration == 2
+    assert after_eval.metadata["score"] == 3.0
+    assert result.metadata["first_score"] == 1.0
     assert result.metadata["final_score"] == 2.0
-    assert result.metadata["score_delta"] == 2.0
+    assert result.metadata["score_delta"] == 1.0
     assert result.apply_result.updated_policy_set.policies[0].version == 3
 
 

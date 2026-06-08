@@ -147,6 +147,7 @@ class Rollout:
     case: Case
     messages: list[Message]
     policy_snapshot_id: str
+    metadata: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(slots=True)
@@ -264,7 +265,7 @@ class PipelineEvaluationResult:
 
 @dataclass(slots=True)
 class PipelineResult:
-    """End-to-end result of a policy optimization pipeline run."""
+    """End-to-end result of a policy optimization pipeline train call."""
 
     analyses: list[RolloutAnalysis]
     gradients: list[Any]
@@ -289,4 +290,3 @@ class RolloutTrainingResult:
     plan: PolicyUpdatePlan
     apply_result: PolicyApplyResult
     metadata: dict[str, Any] = field(default_factory=dict)
-
