@@ -265,9 +265,32 @@ class EmbeddingModelConfig(BaseModel):
             region=self.region,
         )
 
-        # Provider-specific extras that depend on the model/input fields rather
-        # than on credentials (kept only on the parent path).
-        if self.provider == "gemini":
+        self._validate_provider_specific_options(
+            label="Embedding",
+            provider=self.provider,
+            model=self.model,
+        )
+
+        return self
+
+    def _validate_provider_specific_options(
+        self, *, label: str, provider: Optional[str], model: Optional[str]
+    ) -> None:
+        """Validate provider-specific options that go beyond auth.
+
+        These rules depend on the provider/model pair and on parent-level
+        fields (``query_param``, ``document_param``, ``input``, ``dimension``,
+        ``enable_fusion``, etc.) that are shared across all credentials. They
+        must run for both the single-credential path (using ``self.provider``)
+        and the multi-credential path (using each credential's resolved
+        provider/model), otherwise invalid configurations slip past startup
+        validation and surface only at runtime — after collection schema and
+        embedding metadata may already have been written.
+        """
+        if not provider:
+            return
+
+        if provider == "gemini":
             _GEMINI_TASK_TYPES = {
                 "RETRIEVAL_QUERY",
                 "RETRIEVAL_DOCUMENT",
@@ -284,52 +307,63 @@ class EmbeddingModelConfig(BaseModel):
             ]:
                 if value and value.upper() not in _GEMINI_TASK_TYPES:
                     raise ValueError(
-                        f"Invalid {field_name} '{value}' for Gemini. "
+                        f"{label}: invalid {field_name} '{value}' for Gemini. "
                         f"Valid task_types: {', '.join(sorted(_GEMINI_TASK_TYPES))}"
                     )
 
-        elif self.provider == "dashscope":
+        elif provider == "dashscope":
             if self.input == "text" and (
                 self.enable_fusion is not None
                 or self.res_level is not None
                 or self.max_video_frames is not None
             ):
                 raise ValueError(
-                    "Parameters enable_fusion, res_level, and max_video_frames only apply to multimodal input mode"
+                    f"{label}: parameters enable_fusion, res_level, and max_video_frames "
+                    "only apply to multimodal input mode"
                 )
 
-        elif self.provider == "litellm":
+        elif provider == "litellm":
             # litellm handles auth via env vars or explicit api_key; no strict requirement
             if not self.dimension:
                 raise ValueError(
-                    "LiteLLM provider requires 'dimension' to be set explicitly. "
+                    f"{label}: LiteLLM provider requires 'dimension' to be set explicitly. "
                     "Check your embedding model's documentation for the correct dimension."
                 )
 
-        elif self.provider == "local":
+        elif provider == "local":
             from openviking.models.embedder.local_embedders import get_local_model_spec
 
-            get_local_model_spec(self.model)
-
-        return self
+            get_local_model_spec(model)
 
     def _validate_credentials(self) -> None:
         """Validate each credential when credentials list is non-empty.
 
         Each credential must resolve a provider (from itself or the parent) and
         meet that provider's required fields. The parent-level provider/api_key
-        are used as fallbacks where appropriate.
+        are used as fallbacks where appropriate. Provider-specific options that
+        depend on parent-level fields (e.g. LiteLLM dimension, Gemini task
+        types, DashScope multimodal-only params) are also re-checked per
+        resolved credential so the credentials path enforces the same invariants
+        as the single-credential path.
         """
         for idx, cred in enumerate(self.credentials):
             cred_id = cred.id or f"credential-{idx}"
+            label = f"credentials[{cred_id}]"
+            resolved_provider = (cred.provider or self.provider or "").lower() or None
+            resolved_model = cred.model or self.model
             self._validate_provider_auth(
-                label=f"credentials[{cred_id}]",
-                provider=(cred.provider or self.provider or "").lower() or None,
+                label=label,
+                provider=resolved_provider,
                 api_key=cred.api_key or self.api_key,
                 api_base=cred.api_base or self.api_base,
                 ak=cred.ak or self.ak,
                 sk=cred.sk or self.sk,
                 region=cred.region or self.region,
+            )
+            self._validate_provider_specific_options(
+                label=label,
+                provider=resolved_provider,
+                model=resolved_model,
             )
 
     def _validate_credential_dimensions(self) -> None:
