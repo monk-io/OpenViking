@@ -279,12 +279,22 @@ The final output of the model must strictly follow the JSON Schema format shown 
                 tracer.info(f"Extended max_iterations to {max_iterations} for format retry")
                 self._add_format_error_message(messages)
 
-            # If it's the last iteration, fail instead of silently treating an
-            # unparseable final response as "no memory operations".
+            # If it's the last iteration, treat unparseable response as
+            # "no memory operations" rather than failing hard.
             if iteration >= max_iterations:
-                raise RuntimeError(
-                    "Memory extraction final response could not be parsed as JSON operations"
+                tracer.info(
+                    "Memory extraction final response could not be parsed as JSON operations "
+                    f"after {max_iterations} iterations — treating as no operations"
                 )
+                final_operations = ResolvedOperations(
+                    upsert_operations=[],
+                    delete_file_contents=[],
+                    errors=[
+                        "Final response could not be parsed as JSON operations "
+                        f"after {max_iterations} iterations"
+                    ],
+                )
+                break
 
             self._disable_tools_for_iteration = True
             continue

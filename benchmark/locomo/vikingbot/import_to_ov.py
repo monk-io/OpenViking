@@ -682,17 +682,9 @@ async def run_import(args: argparse.Namespace) -> None:
                 file=sys.stderr,
             )
 
-        # 为每个 sample 创建独立的处理协程
-        async def process_sample(item, sample_index):
-            nonlocal \
-                success_count, \
-                error_count, \
-                total_embedding_tokens, \
-                total_vlm_tokens, \
-                total_cache_tokens, \
-                total_reasoning_tokens, \
-                total_llm_output_tokens, \
-                skipped_count
+        # 预先为每个 sample 构建 session 列表（两条调度路径共用）
+        sample_info_list: list[tuple[str, str, list[dict[str, any]]]] = []
+        for sample_index, item in enumerate(samples):
             sample_id = item["sample_id"]
             display_id = f"sample_{sample_index}"
 
@@ -710,13 +702,47 @@ async def run_import(args: argparse.Namespace) -> None:
             print(f"\n=== Sample {display_id} ({sample_id}) ===", file=sys.stderr)
             print(f"    {len(sessions)} session(s) to import", file=sys.stderr)
 
-            async def import_one_session(sess):
+            sample_info_list.append((sample_id, display_id, sessions))
+
+        if session_semaphore is not None:
+            # --- Round-robin 扁平调度：跨 sample 均衡分配并发槽位 ---
+            # 每轮从每个 sample 各取一个 session，保证所有 sample 齐头并进
+            all_sessions_rr: list[tuple[str, str, dict[str, any]]] = []
+            max_sessions = max((len(info[2]) for info in sample_info_list), default=0)
+            for round_i in range(max_sessions):
+                for sample_id, display_id, sessions in sample_info_list:
+                    if round_i < len(sessions):
+                        all_sessions_rr.append(
+                            (sample_id, display_id, sessions[round_i])
+                        )
+
+            print(
+                f"[parallel-sessions] global concurrency={args.parallel_sessions} "
+                f"(round-robin across {len(sample_info_list)} samples)",
+                file=sys.stderr,
+            )
+
+            async def _import_session_rr(
+                sample_id: str,
+                display_id: str,
+                sess: dict[str, any],
+            ) -> dict[str, any]:
+                nonlocal \
+                    success_count, \
+                    error_count, \
+                    total_embedding_tokens, \
+                    total_vlm_tokens, \
+                    total_cache_tokens, \
+                    total_reasoning_tokens, \
+                    total_llm_output_tokens, \
+                    skipped_count
+
                 meta = sess["meta"]
                 messages = sess["messages"]
                 session_key = meta["session_key"]
-                label = f"{session_key} ({meta['date_time']})"
+                label = f"{display_id}/{session_key} ({meta['date_time']})"
 
-                # Skip already ingested sessions unless force-ingest is enabled
+                # Skip already ingested sessions
                 if not args.force_ingest and is_already_ingested(
                     sample_id, session_key, ingest_record, success_keys
                 ):
@@ -732,7 +758,7 @@ async def run_import(args: argparse.Namespace) -> None:
                 )
                 print(f"  [{label}] {preview}", file=sys.stderr)
 
-                return await process_single_session(
+                result = await process_single_session(
                     messages=messages,
                     sample_id=sample_id,
                     display_id=display_id,
@@ -743,52 +769,119 @@ async def run_import(args: argparse.Namespace) -> None:
                     args=args,
                 )
 
-            if session_semaphore is not None:
-                async def import_one_session_with_limit(sess):
-                    async with session_semaphore:
-                        return await import_one_session(sess)
+                if result.get("status") == "success":
+                    success_count += 1
+                    total_embedding_tokens += result.get("embedding_tokens", 0)
+                    total_vlm_tokens += result.get("vlm_tokens", 0)
+                    total_cache_tokens += result.get("cache_tokens", 0)
+                    total_reasoning_tokens += result.get("reasoning_tokens", 0)
+                    total_llm_output_tokens += result.get("llm_output_tokens", 0)
+                elif result.get("status") == "error":
+                    error_count += 1
+                elif result.get("status") == "skipped":
+                    skipped_count += 1
 
-                session_results = await asyncio.gather(
-                    *(import_one_session_with_limit(sess) for sess in sessions),
-                    return_exceptions=True,
-                )
-            else:
+                return result
+
+            async def _import_session_limited(
+                sample_id: str, display_id: str, sess: dict[str, any]
+            ) -> dict[str, any]:
+                async with session_semaphore:
+                    return await _import_session_rr(sample_id, display_id, sess)
+
+            # 按 round-robin 顺序创建所有 task；semaphore 的 FIFO 队列保证执行顺序
+            # 也基本是 round-robin 的，从而实现跨 sample 均衡
+            tasks = [
+                asyncio.create_task(_import_session_limited(sid, did, sess))
+                for sid, did, sess in all_sessions_rr
+            ]
+
+        else:
+            # --- Per-sample 串行调度：每个 sample 内 session 顺序执行 ---
+            # sample 间并发由 --parallel-samples 控制（默认无限制）
+            async def process_sample(sample_id, display_id, sessions):
+                nonlocal \
+                    success_count, \
+                    error_count, \
+                    total_embedding_tokens, \
+                    total_vlm_tokens, \
+                    total_cache_tokens, \
+                    total_reasoning_tokens, \
+                    total_llm_output_tokens, \
+                    skipped_count
+
+                async def import_one_session(sess):
+                    meta = sess["meta"]
+                    messages = sess["messages"]
+                    session_key = meta["session_key"]
+                    label = f"{session_key} ({meta['date_time']})"
+
+                    # Skip already ingested sessions
+                    if not args.force_ingest and is_already_ingested(
+                        sample_id, session_key, ingest_record, success_keys
+                    ):
+                        print(
+                            f"  [{label}] [SKIP] already imported (use --force-ingest to reprocess)",
+                            file=sys.stderr,
+                        )
+                        return {"status": "skipped"}
+
+                    # Preview messages
+                    preview = " | ".join(
+                        [f"{msg['role']}: {msg['text'][:30]}..." for msg in messages[:3]]
+                    )
+                    print(f"  [{label}] {preview}", file=sys.stderr)
+
+                    return await process_single_session(
+                        messages=messages,
+                        sample_id=sample_id,
+                        display_id=display_id,
+                        session_key=session_key,
+                        meta=meta,
+                        run_time=run_time,
+                        ingest_record=ingest_record,
+                        args=args,
+                    )
+
                 session_results = []
                 for sess in sessions:
                     session_results.append(await import_one_session(sess))
 
-            for res in session_results:
-                if isinstance(res, Exception):
-                    error_count += 1
-                    print(f"  [ERROR] parallel session task failed: {res}", file=sys.stderr)
-                    continue
-                if res.get("status") == "success":
-                    success_count += 1
-                    total_embedding_tokens += res.get("embedding_tokens", 0)
-                    total_vlm_tokens += res.get("vlm_tokens", 0)
-                    total_cache_tokens += res.get("cache_tokens", 0)
-                    total_reasoning_tokens += res.get("reasoning_tokens", 0)
-                    total_llm_output_tokens += res.get("llm_output_tokens", 0)
-                elif res.get("status") == "error":
-                    error_count += 1
-                elif res.get("status") == "skipped":
-                    skipped_count += 1
+                for res in session_results:
+                    if isinstance(res, Exception):
+                        error_count += 1
+                        print(f"  [ERROR] session task failed: {res}", file=sys.stderr)
+                        continue
+                    if res.get("status") == "success":
+                        success_count += 1
+                        total_embedding_tokens += res.get("embedding_tokens", 0)
+                        total_vlm_tokens += res.get("vlm_tokens", 0)
+                        total_cache_tokens += res.get("cache_tokens", 0)
+                        total_reasoning_tokens += res.get("reasoning_tokens", 0)
+                        total_llm_output_tokens += res.get("llm_output_tokens", 0)
+                    elif res.get("status") == "error":
+                        error_count += 1
+                    elif res.get("status") == "skipped":
+                        skipped_count += 1
 
-        if args.parallel_samples:
-            semaphore = asyncio.Semaphore(args.parallel_samples)
+            if args.parallel_samples:
+                semaphore = asyncio.Semaphore(args.parallel_samples)
 
-            async def process_sample_with_limit(item, sample_index):
-                async with semaphore:
-                    await process_sample(item, sample_index)
+                async def process_sample_with_limit(sample_id, display_id, sessions):
+                    async with semaphore:
+                        await process_sample(sample_id, display_id, sessions)
 
-            tasks = [
-                asyncio.create_task(process_sample_with_limit(item, idx))
-                for idx, item in enumerate(samples)
-            ]
-        else:
-            tasks = [
-                asyncio.create_task(process_sample(item, idx)) for idx, item in enumerate(samples)
-            ]
+                tasks = [
+                    asyncio.create_task(
+                        process_sample_with_limit(sid, did, sessions)
+                    )
+                    for sid, did, sessions in sample_info_list
+                ]
+            else:
+                tasks = [
+                    asyncio.create_task(process_sample(sid, did, sessions))
+                    for sid, did, sessions in sample_info_list
+                ]
 
     else:
         # Plain text format
