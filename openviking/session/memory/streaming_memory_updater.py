@@ -35,6 +35,7 @@ from openviking.session.memory.memory_updater import (
     ExtractContext,
     MemoryUpdater,
     MemoryUpdateResult,
+    write_stored_links,
 )
 from openviking.session.memory.merge_op import MergeOpFactory
 from openviking.session.memory.patch_merge_context_provider import (
@@ -80,6 +81,14 @@ class StreamingMemoryUpdaterKey:
     user_id: str
 
 
+@dataclass(frozen=True, slots=True)
+class MemoryMergeGroupKey:
+    """Per-scope/type batching key for second-stage memory merges."""
+
+    peer_id: str | None
+    memory_type: str
+
+
 @dataclass(slots=True)
 class MemoryUpdateRequest:
     """One commit's resolved user-memory update request."""
@@ -109,26 +118,19 @@ class StreamingMemoryUpdater:
     registry: MemoryTypeRegistry | None = None
     vikingdb: Any = None
     config: StreamingMemoryUpdaterConfig = field(default_factory=StreamingMemoryUpdaterConfig)
-    _batcher: StreamingBatcher[MemoryUpdateRequest, StreamingMemoryUpdateResult] = field(
-        init=False, repr=False
-    )
+    _group_batchers: dict[
+        MemoryMergeGroupKey,
+        StreamingBatcher[MemoryUpdateRequest, StreamingMemoryUpdateResult],
+    ] = field(init=False, repr=False)
+    _group_batchers_lock: asyncio.Lock = field(init=False, repr=False)
     _apply_lock: asyncio.Lock = field(init=False, repr=False)
     _last_result: StreamingMemoryUpdateResult | None = field(init=False, default=None, repr=False)
     _closed: bool = field(init=False, default=False, repr=False)
 
     def __post_init__(self) -> None:
         self.registry = self.registry or create_default_registry()
-        self._batcher = StreamingBatcher(
-            name="openviking-streaming-memory-updater",
-            process_batch=self._process_batch,
-            config=StreamingBatcherConfig(
-                max_items_per_batch=self.config.max_operations_per_update,
-                max_wait_seconds=self.config.max_wait_seconds,
-                timer_check_interval_seconds=self.config.timer_check_interval_seconds,
-            ),
-            item_size=lambda request: _operation_count(request.operations),
-            result_metadata=lambda result: result.metadata,
-        )
+        self._group_batchers = {}
+        self._group_batchers_lock = asyncio.Lock()
         self._apply_lock = asyncio.Lock()
         self._last_result = None
         self._closed = False
@@ -142,13 +144,20 @@ class StreamingMemoryUpdater:
         return self._last_result
 
     async def get_buffered_operation_count(self) -> int:
-        return await self._batcher.get_buffered_size()
+        async with self._group_batchers_lock:
+            batchers = list(self._group_batchers.values())
+        sizes = await asyncio.gather(*(batcher.get_buffered_size() for batcher in batchers))
+        return sum(sizes)
 
     async def close(self) -> StreamingMemoryUpdateResult | None:
         if self._closed:
             return None
         self._closed = True
-        return await self._batcher.close()
+        async with self._group_batchers_lock:
+            batchers = list(self._group_batchers.values())
+            self._group_batchers = {}
+        results = await asyncio.gather(*(batcher.close() for batcher in batchers))
+        return combine_streaming_memory_results(*results)
 
     @tracer("memory.streaming_updater.submit", ignore_result=True, ignore_args=True)
     async def submit(self, request: MemoryUpdateRequest) -> StreamingMemoryUpdateResult:
@@ -171,7 +180,11 @@ class StreamingMemoryUpdater:
             if append_only_request is not None
             else None
         )
-        merge_result = await self._batcher.submit(merge_request) if merge_request is not None else None
+        merge_result = (
+            await self._submit_grouped_merge_request(merge_request)
+            if merge_request is not None
+            else None
+        )
         result = combine_streaming_memory_results(
             append_result,
             merge_result,
@@ -192,6 +205,90 @@ class StreamingMemoryUpdater:
             console=self.config.trace_console,
         )
         return result
+
+    async def _submit_grouped_merge_request(
+        self,
+        request: MemoryUpdateRequest,
+    ) -> StreamingMemoryUpdateResult | None:
+        grouped_requests = split_request_by_merge_group(request)
+        if not grouped_requests:
+            return None
+        submissions = [
+            (await self._get_group_batcher(group_key)).submit(group_request)
+            for group_key, group_request in grouped_requests
+        ]
+        group_results = list(await asyncio.gather(*submissions))
+        result = combine_streaming_memory_results(*group_results, fallback_request_count=1)
+        await self._apply_post_group_links(request, result)
+        return result
+
+    async def _apply_post_group_links(
+        self,
+        request: MemoryUpdateRequest,
+        result: StreamingMemoryUpdateResult,
+    ) -> None:
+        links = merge_link_lists(list(getattr(request.operations, "resolved_links", []) or []))
+        if not links:
+            return
+        valid_links = await filter_valid_links(
+            links,
+            upsert_operations=result.operations.upsert_operations,
+            delete_file_contents=result.operations.delete_file_contents,
+            ctx=request.ctx,
+            trace_console=self.config.trace_console,
+        )
+        if not valid_links:
+            return
+        viking_fs = safe_get_viking_fs()
+        if viking_fs is not None:
+            await write_stored_links(valid_links, request.ctx, viking_fs)
+            for uri in dict.fromkeys(
+                uri for link in valid_links for uri in (link.from_uri, link.to_uri) if uri
+            ):
+                result.apply_result.add_edited(uri)
+        result.operations.resolved_links = merge_link_lists(
+            list(getattr(result.operations, "resolved_links", []) or []),
+            valid_links,
+        )
+
+    async def _get_group_batcher(
+        self,
+        group_key: MemoryMergeGroupKey,
+    ) -> StreamingBatcher[MemoryUpdateRequest, StreamingMemoryUpdateResult]:
+        async with self._group_batchers_lock:
+            batcher = self._group_batchers.get(group_key)
+            if batcher is not None:
+                return batcher
+
+            batcher = self._create_group_batcher(group_key)
+            self._group_batchers[group_key] = batcher
+            return batcher
+
+    def _create_group_batcher(
+        self,
+        group_key: MemoryMergeGroupKey,
+    ) -> StreamingBatcher[MemoryUpdateRequest, StreamingMemoryUpdateResult]:
+        async def process_batch(
+            requests: list[MemoryUpdateRequest],
+            reason: str,
+        ) -> StreamingMemoryUpdateResult:
+            return await self._process_batch(group_key, requests, reason)
+
+        batcher = StreamingBatcher(
+            name=(
+                "openviking-streaming-memory-updater:"
+                f"{group_key.peer_id or 'self'}:{group_key.memory_type}"
+            ),
+            process_batch=process_batch,
+            config=StreamingBatcherConfig(
+                max_items_per_batch=self.config.max_operations_per_update,
+                max_wait_seconds=self.config.max_wait_seconds,
+                timer_check_interval_seconds=self.config.timer_check_interval_seconds,
+            ),
+            item_size=lambda request: _operation_count(request.operations),
+            result_metadata=lambda result: result.metadata,
+        )
+        return batcher
 
     def _split_append_only_request(
         self, request: MemoryUpdateRequest
@@ -282,6 +379,7 @@ class StreamingMemoryUpdater:
 
     async def _process_batch(
         self,
+        group_key: MemoryMergeGroupKey,
         requests: list[MemoryUpdateRequest],
         reason: str,
     ) -> StreamingMemoryUpdateResult:
@@ -296,7 +394,7 @@ class StreamingMemoryUpdater:
         )
         tracer.info(
             "StreamingMemoryUpdater flush started "
-            f"reason={reason} request_count={len(requests)} "
+            f"group={group_key} reason={reason} request_count={len(requests)} "
             f"input_operations={input_operations} "
             f"input_patches={input_patches} "
             f"input_deletes={input_deletes}",
@@ -316,12 +414,13 @@ class StreamingMemoryUpdater:
             metadata={
                 "flush_reason": reason,
                 "operation_count": _operation_count(merged_operations),
+                "merge_group": _merge_group_key_label(group_key),
             },
         )
         self._last_result = result
         tracer.info(
             "StreamingMemoryUpdater flush finished "
-            f"reason={reason} request_count={len(requests)} "
+            f"group={group_key} reason={reason} request_count={len(requests)} "
             f"written_uris={apply_result.written_uris} "
             f"edited_uris={apply_result.edited_uris} "
             f"deleted_uris={apply_result.deleted_uris} "
@@ -373,6 +472,82 @@ class StreamingMemoryUpdater:
             strict_extract_errors=any(request.strict_extract_errors for request in requests),
             trace_console=self.config.trace_console,
         )
+
+
+def split_request_by_merge_group(
+    request: MemoryUpdateRequest,
+) -> list[tuple[MemoryMergeGroupKey, MemoryUpdateRequest]]:
+    """Split one commit request into per-(peer_id, memory_type) merge requests.
+
+    A submit/session.commit awaits all returned group requests, so commits touching
+    multiple memory types still return only after every affected group is merged
+    and applied.
+    """
+    operations = request.operations
+    upsert_groups: dict[MemoryMergeGroupKey, list[ResolvedOperation]] = {}
+    delete_groups: dict[MemoryMergeGroupKey, list[MemoryFile]] = {}
+    passthrough_upserts: list[ResolvedOperation] = []
+
+    for op in list(operations.upsert_operations or []):
+        if not op.uris:
+            passthrough_upserts.append(op)
+            continue
+        peer_id = _peer_id_for_operation(op)
+        for uri in op.uris:
+            single_uri_op = clone_operation_for_uri(op, uri)
+            group_key = MemoryMergeGroupKey(peer_id=peer_id, memory_type=single_uri_op.memory_type)
+            upsert_groups.setdefault(group_key, []).append(single_uri_op)
+
+    for file in list(operations.delete_file_contents or []):
+        group_key = MemoryMergeGroupKey(
+            peer_id=_peer_id_for_memory_file(file),
+            memory_type=file.memory_type or "",
+        )
+        delete_groups.setdefault(group_key, []).append(file)
+
+    group_keys = list(dict.fromkeys(list(upsert_groups.keys()) + list(delete_groups.keys())))
+    grouped_requests: list[tuple[MemoryMergeGroupKey, MemoryUpdateRequest]] = []
+    for group_key in group_keys:
+        group_upserts = upsert_groups.get(group_key, [])
+        group_deletes = delete_groups.get(group_key, [])
+        grouped_requests.append(
+            (
+                group_key,
+                clone_memory_update_request(
+                    request,
+                    operations=ResolvedOperations(
+                        upsert_operations=group_upserts,
+                        delete_file_contents=group_deletes,
+                        errors=list(operations.errors or []),
+                        resolved_links=[],
+                    ),
+                ),
+            )
+        )
+
+    if passthrough_upserts:
+        group_key = MemoryMergeGroupKey(peer_id=None, memory_type="")
+        grouped_requests.append(
+            (
+                group_key,
+                clone_memory_update_request(
+                    request,
+                    operations=ResolvedOperations(
+                        upsert_operations=passthrough_upserts,
+                        delete_file_contents=[],
+                        errors=list(operations.errors or []),
+                        resolved_links=[],
+                    ),
+                ),
+            )
+        )
+    return grouped_requests
+
+
+def _merge_group_key_label(group_key: MemoryMergeGroupKey) -> str:
+    peer_label = group_key.peer_id or "self"
+    memory_type = group_key.memory_type or "unknown"
+    return f"peer={peer_label},memory_type={memory_type}"
 
 
 async def merge_memory_operations(

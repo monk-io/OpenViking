@@ -18,17 +18,20 @@ from openviking.session.memory.dataclass import (
     ResolvedOperations,
     StoredLink,
 )
-from openviking.session.memory.memory_updater import ExtractContext
 from openviking.session.memory.memory_type_registry import MemoryTypeRegistry
+from openviking.session.memory.memory_updater import ExtractContext
 from openviking.session.memory.merge_op.base import FieldType, MergeOp, SearchReplaceBlock, StrPatch
 from openviking.session.memory.streaming_memory_updater import (
+    MemoryMergeGroupKey,
     MemoryUpdateRequest,
     StreamingMemoryUpdater,
     StreamingMemoryUpdaterConfig,
     classify_memory_merge_mode,
     merge_one_memory_type_operations,
     operation_to_patch,
+    split_request_by_merge_group,
 )
+from openviking.session.memory.utils.memory_file_utils import MemoryFileUtils
 from openviking_cli.session.user_id import UserIdentifier
 
 
@@ -160,6 +163,13 @@ def _note_op(name: str) -> ResolvedOperation:
 def _note_op_with_source(name: str, extraction_id: str) -> ResolvedOperation:
     op = _note_op(name)
     op.memory_fields["source_extraction_id"] = extraction_id
+    return op
+
+
+def _peer_note_op(name: str, peer_id: str) -> ResolvedOperation:
+    op = _note_op(name)
+    op.memory_fields["peer_id"] = peer_id
+    op.uris = [f"viking://user/u/peers/{peer_id}/memories/notes/{name}.md"]
     return op
 
 
@@ -425,6 +435,215 @@ async def test_streaming_memory_updater_batches_non_append_only_submits(monkeypa
     assert result1.request_count == 2
     assert result1.metadata["flush_reason"] == "count"
     assert sorted(result1.apply_result.written_uris) == sorted([op1.uris[0], op2.uris[0]])
+
+
+def test_split_request_by_merge_group_groups_by_peer_and_memory_type():
+    self_op = _note_op("self_note")
+    peer_op = _peer_note_op("peer_note", "web:visitor:alice")
+    case_op = _case_op("case_note")
+    link = StoredLink(
+        from_uri=self_op.uris[0],
+        to_uri=peer_op.uris[0],
+        link_type="related_to",
+        weight=0.8,
+    )
+    request = MemoryUpdateRequest(
+        operations=ResolvedOperations(
+            upsert_operations=[self_op, peer_op, case_op],
+            delete_file_contents=[],
+            errors=[],
+            resolved_links=[link],
+        ),
+        messages=[],
+        ctx=_ctx(),
+    )
+
+    grouped = split_request_by_merge_group(request)
+
+    assert [key for key, _ in grouped] == [
+        MemoryMergeGroupKey(peer_id=None, memory_type="notes"),
+        MemoryMergeGroupKey(peer_id="web:visitor:alice", memory_type="notes"),
+        MemoryMergeGroupKey(peer_id=None, memory_type="cases"),
+    ]
+    assert [len(group_request.operations.upsert_operations) for _, group_request in grouped] == [
+        1,
+        1,
+        1,
+    ]
+    assert [len(group_request.operations.resolved_links) for _, group_request in grouped] == [
+        0,
+        0,
+        0,
+    ]
+
+
+@pytest.mark.asyncio
+async def test_streaming_memory_updater_batches_per_merge_group(monkeypatch):
+    fs = InMemoryVikingFS({})
+    fs.search = AsyncMock(return_value=[])
+    monkeypatch.setattr(
+        "openviking.session.memory.streaming_memory_updater.get_viking_fs",
+        lambda: fs,
+    )
+    monkeypatch.setattr(
+        "openviking.session.memory.memory_updater.get_viking_fs",
+        lambda: fs,
+    )
+
+    updater = StreamingMemoryUpdater(
+        registry=_registry(),
+        config=StreamingMemoryUpdaterConfig(
+            max_operations_per_update=2,
+            max_wait_seconds=0.05,
+            timer_check_interval_seconds=0.01,
+        ),
+    )
+    note_a = _note_op("note_group_a")
+    note_b = _note_op("note_group_b")
+    peer_note = _peer_note_op("note_peer", "web:visitor:alice")
+
+    result1, result2, peer_result = await asyncio.gather(
+        updater.submit(
+            MemoryUpdateRequest(
+                operations=ResolvedOperations(
+                    upsert_operations=[note_a],
+                    delete_file_contents=[],
+                    errors=[],
+                ),
+                messages=[Message(id="m1", role="user", parts=[TextPart("note A")])],
+                ctx=_ctx(),
+            )
+        ),
+        updater.submit(
+            MemoryUpdateRequest(
+                operations=ResolvedOperations(
+                    upsert_operations=[note_b],
+                    delete_file_contents=[],
+                    errors=[],
+                ),
+                messages=[Message(id="m2", role="user", parts=[TextPart("note B")])],
+                ctx=_ctx(),
+            )
+        ),
+        updater.submit(
+            MemoryUpdateRequest(
+                operations=ResolvedOperations(
+                    upsert_operations=[peer_note],
+                    delete_file_contents=[],
+                    errors=[],
+                ),
+                messages=[Message(id="m3", role="user", parts=[TextPart("peer note")])],
+                ctx=_ctx(),
+            )
+        ),
+    )
+
+    assert result1 is result2
+    assert result1.request_count == 2
+    assert result1.metadata["flush_reason"] == "count"
+    assert result1.metadata["merge_group"] == "peer=self,memory_type=notes"
+    assert sorted(result1.apply_result.written_uris) == sorted([note_a.uris[0], note_b.uris[0]])
+
+    assert peer_result is not result1
+    assert peer_result.request_count == 1
+    assert peer_result.metadata["flush_reason"] == "time"
+    assert peer_result.metadata["merge_group"] == "peer=web:visitor:alice,memory_type=notes"
+    assert peer_result.apply_result.written_uris == [peer_note.uris[0]]
+
+
+@pytest.mark.asyncio
+async def test_streaming_memory_updater_submit_waits_for_all_merge_groups(monkeypatch):
+    fs = InMemoryVikingFS({})
+    fs.search = AsyncMock(return_value=[])
+    monkeypatch.setattr(
+        "openviking.session.memory.streaming_memory_updater.get_viking_fs",
+        lambda: fs,
+    )
+    monkeypatch.setattr(
+        "openviking.session.memory.memory_updater.get_viking_fs",
+        lambda: fs,
+    )
+
+    updater = StreamingMemoryUpdater(
+        registry=_registry(),
+        config=StreamingMemoryUpdaterConfig(
+            max_operations_per_update=8,
+            max_wait_seconds=0.01,
+            timer_check_interval_seconds=0.01,
+        ),
+    )
+    self_op = _note_op("multi_self")
+    peer_op = _peer_note_op("multi_peer", "web:visitor:alice")
+
+    result = await updater.submit(
+        MemoryUpdateRequest(
+            operations=ResolvedOperations(
+                upsert_operations=[self_op, peer_op],
+                delete_file_contents=[],
+                errors=[],
+            ),
+            messages=[Message(id="m1", role="user", parts=[TextPart("multi group")])],
+            ctx=_ctx(),
+        )
+    )
+
+    assert result.metadata["combined_result"] is True
+    assert result.request_count == 2
+    assert sorted(result.apply_result.written_uris) == sorted([self_op.uris[0], peer_op.uris[0]])
+    assert self_op.uris[0] in fs.files
+    assert peer_op.uris[0] in fs.files
+
+
+@pytest.mark.asyncio
+async def test_streaming_memory_updater_applies_cross_group_links_after_all_groups(monkeypatch):
+    fs = InMemoryVikingFS({})
+    fs.search = AsyncMock(return_value=[])
+    monkeypatch.setattr(
+        "openviking.session.memory.streaming_memory_updater.get_viking_fs",
+        lambda: fs,
+    )
+    monkeypatch.setattr(
+        "openviking.session.memory.memory_updater.get_viking_fs",
+        lambda: fs,
+    )
+
+    updater = StreamingMemoryUpdater(
+        registry=_registry(),
+        config=StreamingMemoryUpdaterConfig(
+            max_operations_per_update=8,
+            max_wait_seconds=0.01,
+            timer_check_interval_seconds=0.01,
+        ),
+    )
+    self_op = _note_op("linked_self")
+    peer_op = _peer_note_op("linked_peer", "web:visitor:alice")
+    link = StoredLink(
+        from_uri=self_op.uris[0],
+        to_uri=peer_op.uris[0],
+        link_type="related_to",
+        weight=0.8,
+        match_text="linked",
+    )
+
+    result = await updater.submit(
+        MemoryUpdateRequest(
+            operations=ResolvedOperations(
+                upsert_operations=[self_op, peer_op],
+                delete_file_contents=[],
+                errors=[],
+                resolved_links=[link],
+            ),
+            messages=[Message(id="m1", role="user", parts=[TextPart("cross group link")])],
+            ctx=_ctx(),
+        )
+    )
+
+    self_file = MemoryFileUtils.read(fs.files[self_op.uris[0]], uri=self_op.uris[0])
+    peer_file = MemoryFileUtils.read(fs.files[peer_op.uris[0]], uri=peer_op.uris[0])
+
+    assert len(result.operations.resolved_links) == 1
+    assert self_file.links[0]["to_uri"] == peer_op.uris[0]
+    assert peer_file.backlinks[0]["from_uri"] == self_op.uris[0]
 
 
 def test_classify_memory_merge_mode_forces_cross_extraction_merge():
