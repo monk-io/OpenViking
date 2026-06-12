@@ -46,6 +46,8 @@ class VikingClient:
         self.ov_path = config.ov_data_path
         self.mode = openviking_config.mode
         self.auth_mode = (openviking_config.auth_mode or "").strip().lower()
+        self._request_connection = self._normalize_connection(connection)
+        self._request_role: str | None = None
         self.api_key_type = (openviking_config.api_key_type or "user").strip().lower()
         if self._is_trusted_mode():
             self.api_key_type = "user"
@@ -60,8 +62,6 @@ class VikingClient:
             "isolate_agent_scope_by_user": False,
         }
         self._namespace_policy_loaded = False
-        self._request_connection = self._normalize_connection(connection)
-        self._request_role: str | None = None
 
         if openviking_config.mode == "local":
             if agent_id is None or _is_session_key(agent_id):
