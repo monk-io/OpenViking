@@ -201,6 +201,68 @@ describe("context-engine assemble()", () => {
     expect(recorded.resourceTypes).toEqual(["user"]);
   });
 
+  it("uses user and agent auto-recall targets by default during transformContext", async () => {
+    const traces = new RecallTraceMemoryStore(10);
+    const { engine, client } = makeEngine(
+      {
+        latest_archive_overview: "unused",
+        pre_archive_abstracts: [],
+        messages: [],
+        estimatedTokens: 0,
+        stats: makeStats(),
+      },
+      {
+        traceRecorder: traces,
+        cfgOverrides: {
+          autoRecall: true,
+          recallPreferAbstract: true,
+        },
+      },
+    );
+    client.find.mockImplementation(async (_query: string, options: { targetUri?: string }) => {
+      if (options.targetUri === "viking://user/memories") {
+        return {
+          memories: [
+            {
+              uri: "viking://user/default/memories/gateway-docs",
+              level: 2,
+              category: "memory",
+              abstract: "Gateway plugin docs live in the user memory store.",
+              score: 0.9,
+            },
+          ],
+          total: 1,
+        };
+      }
+      if (options.targetUri === "viking://agent/memories") {
+        return { memories: [], total: 0 };
+      }
+      throw new Error(`unexpected auto-recall target: ${options.targetUri ?? "none"}`);
+    });
+
+    await engine.assemble({
+      sessionId: "session-transform-default-targets",
+      messages: [{ role: "user", content: "where are the gateway plugin docs?" }],
+    });
+
+    const targetUris = client.find.mock.calls.map(([, options]) => options.targetUri);
+    expect(targetUris).toEqual([
+      "viking://user/memories",
+      "viking://agent/memories",
+    ]);
+
+    const recorded = traces.query({
+      turn: "latest",
+      sessionId: "session-transform-default-targets",
+      limit: 10,
+    }).entries[0]!;
+    expect(recorded.resourceTypes).toEqual(["user", "agent"]);
+    expect(recorded.searches.map((search) => search.targetUriResolved)).toEqual([
+      "viking://user/memories",
+      "viking://agent/memories",
+    ]);
+  });
+
   it("passes sender peer_id to transformContext auto-recall when peer_role is person", async () => {
     vi.stubGlobal(
       "fetch",
