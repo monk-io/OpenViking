@@ -118,6 +118,7 @@ def _make_config(api_key_type: str, mode: str = "remote", **ov_overrides):
     agents = SimpleNamespace(**{**agent_defaults, **agent_overrides})
     ov_server = SimpleNamespace(
         mode=mode,
+        auth_mode="",
         api_key_type=api_key_type,
         server_url="http://ov.local",
         api_key="user-key",
