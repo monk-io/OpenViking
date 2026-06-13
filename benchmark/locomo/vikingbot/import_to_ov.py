@@ -15,6 +15,7 @@ import argparse
 import asyncio
 import csv
 import json
+import re
 import sys
 import time
 import traceback
@@ -23,6 +24,9 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import openviking as ov
+
+
+TRACE_ID_RE = re.compile(r"\btrace_id=([^,\s:]+)")
 
 
 def _get_session_number(session_key: str) -> int:
@@ -237,6 +241,17 @@ def write_error_record(
         session = record["session"]
         error = record["error"]
         f.write(f"[{timestamp}] ERROR [{sample_id}/{session}]: {error}\n")
+
+
+def extract_trace_id_from_error(error: str) -> str:
+    match = TRACE_ID_RE.search(error or "")
+    return match.group(1) if match else ""
+
+
+def record_failed_trace_id(result: Dict[str, Any], failed_trace_ids: list[str]) -> None:
+    trace_id = result.get("trace_id") or extract_trace_id_from_error(result.get("error", ""))
+    if trace_id:
+        failed_trace_ids.append(str(trace_id))
 
 
 def load_ingest_record(record_path: str = "./result/.ingest_record.json") -> Dict[str, Any]:
@@ -522,6 +537,7 @@ async def process_single_session(
             "session": session_key,
             "status": "error",
             "error": error_message,
+            "trace_id": extract_trace_id_from_error(error_message),
         }
 
         # 写入错误日志
@@ -646,6 +662,7 @@ async def run_import(args: argparse.Namespace) -> None:
     total_cache_tokens = 0
     total_reasoning_tokens = 0
     total_llm_output_tokens = 0
+    failed_trace_ids: list[str] = []
     tasks = []
     session_semaphore = asyncio.Semaphore(args.parallel_sessions) if args.parallel_sessions else None
     if args.parallel_sessions:
@@ -778,6 +795,7 @@ async def run_import(args: argparse.Namespace) -> None:
                     total_llm_output_tokens += result.get("llm_output_tokens", 0)
                 elif result.get("status") == "error":
                     error_count += 1
+                    record_failed_trace_id(result, failed_trace_ids)
                 elif result.get("status") == "skipped":
                     skipped_count += 1
 
@@ -861,6 +879,7 @@ async def run_import(args: argparse.Namespace) -> None:
                         total_llm_output_tokens += res.get("llm_output_tokens", 0)
                     elif res.get("status") == "error":
                         error_count += 1
+                        record_failed_trace_id(res, failed_trace_ids)
                     elif res.get("status") == "skipped":
                         skipped_count += 1
 
@@ -954,6 +973,7 @@ async def run_import(args: argparse.Namespace) -> None:
                     total_llm_output_tokens += r.get("llm_output_tokens", 0)
                 elif r.get("status") == "error":
                     error_count += 1
+                    record_failed_trace_id(r, failed_trace_ids)
 
     # Final summary
     total_processed = success_count + error_count + skipped_count
@@ -962,6 +982,10 @@ async def run_import(args: argparse.Namespace) -> None:
     print(f"Successfully imported: {success_count}", file=sys.stderr)
     print(f"Failed: {error_count}", file=sys.stderr)
     print(f"Skipped (already imported): {skipped_count}", file=sys.stderr)
+    if failed_trace_ids:
+        print("Failed trace IDs:", file=sys.stderr)
+        for trace_id in failed_trace_ids:
+            print(trace_id, file=sys.stderr)
     print("\n=== Token usage summary ===", file=sys.stderr)
     print(f"Total Embedding tokens: {total_embedding_tokens}", file=sys.stderr)
     print(f"Total VLM tokens: {total_vlm_tokens}", file=sys.stderr)
