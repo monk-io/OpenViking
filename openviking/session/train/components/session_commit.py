@@ -25,6 +25,8 @@ from openviking.session.train.domain import (
 from openviking_cli.client.http import AsyncHTTPClient
 
 _TRAINING_COMMIT_MEMORY_TYPES = ("cases", "trajectories", "experiences")
+_TRAINING_CASE_SPEC_PROTOCOL = "openviking.batch_train.case_spec.v1"
+_TRAINING_CASE_SPEC_HEADER = "# OpenViking Batch Training CaseSpec v1"
 _SESSION_BATCH_ADD_MESSAGE_LIMIT = 100
 
 
@@ -407,10 +409,10 @@ def _case_spec_message_to_request(rollout: Rollout) -> dict[str, Any]:
             {
                 "type": "text",
                 "text": (
-                    "# OpenViking Training CaseSpec\n\n"
+                    f"{_TRAINING_CASE_SPEC_HEADER}\n\n"
                     "The following structured case and rubric describe the task that "
-                    "produced this rollout. Use it as task context when extracting "
-                    "training memories.\n\n"
+                    "produced this rollout. It is control-plane metadata for the "
+                    "batch training pipeline.\n\n"
                     f"```json\n{_case_spec_payload_json(rollout)}\n```"
                 ),
             }
@@ -423,11 +425,14 @@ def _case_spec_payload_json(rollout: Rollout) -> str:
 
     case = rollout.case
     payload = {
+        "protocol": _TRAINING_CASE_SPEC_PROTOCOL,
         "case": {
             "name": case.name,
             "task_signature": case.task_signature,
             "input": _case_input_payload(case.input),
+            "metadata": dict(case.metadata or {}),
             "rubric": {
+                "name": case.rubric.name,
                 "description": case.rubric.description,
                 "criteria": [
                     {

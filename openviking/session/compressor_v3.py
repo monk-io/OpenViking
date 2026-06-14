@@ -13,6 +13,7 @@ submitted to the process-global StreamingPolicyTrainer.
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, List, Optional
@@ -23,6 +24,7 @@ from openviking.message import Message
 from openviking.server.identity import RequestContext
 from openviking.session.memory import ExtractLoop, MemoryUpdater, StreamingMemoryUpdaterConfig
 from openviking.session.memory.dataclass import (
+    MemoryOperationSource,
     ResolvedOperation,
     ResolvedOperations,
 )
@@ -39,6 +41,7 @@ from openviking.session.memory.streaming_memory_updater import (
 )
 from openviking.session.memory.utils.json_parser import JsonUtils
 from openviking.session.memory.utils.memory_file_utils import MemoryFileUtils
+from openviking.session.memory.utils.uri import generate_uri
 from openviking.session.train import (
     Case,
     ExperienceGradientContext,
@@ -65,7 +68,10 @@ from openviking_cli.utils.config import get_openviking_config
 logger = get_logger(__name__)
 
 _CASES_MEMORY_TYPE = "cases"
-
+_TRAINING_CASE_SPEC_PROTOCOL = "openviking.batch_train.case_spec.v1"
+_TRAINING_CASE_SPEC_HEADER = "# OpenViking Batch Training CaseSpec v1"
+_TRAINING_FAST_PATH_MEMORY_TYPES = frozenset({"cases", "trajectories", "experiences"})
+_JSON_FENCE_RE = re.compile(r"```(?:json)?\s*(.*?)\s*```", re.DOTALL | re.IGNORECASE)
 
 
 class SessionCompressorV3:
@@ -223,8 +229,21 @@ class SessionCompressorV3:
         allow_self_memory: bool = True,
         allowed_peer_ids: Optional[set[str]] = None,
     ):
+        message_list = list(messages)
+        fast_path_case = _training_case_from_first_message(message_list, allowed_memory_types)
+        if fast_path_case is not None:
+            contexts = await self._commit_training_case_fast_path(
+                case=fast_path_case,
+                messages=message_list,
+                ctx=ctx,
+                session_id=session_id,
+                archive_uri=archive_uri or "",
+                strict_extract_errors=strict_extract_errors,
+            )
+            return contexts
+
         result = await self._extract_user_memories(
-            messages=list(messages),
+            messages=message_list,
             user=user,
             session_id=session_id,
             ctx=ctx,
@@ -237,13 +256,120 @@ class SessionCompressorV3:
         )
         await self.train_from_extracted_cases(
             cases=result.cases,
-            messages=messages,
+            messages=message_list,
             ctx=ctx,
             session_id=session_id,
             archive_uri=archive_uri or "",
             strict_extract_errors=strict_extract_errors,
         )
         return result.contexts
+
+    async def _commit_training_case_fast_path(
+        self,
+        *,
+        case: Case,
+        messages: list[Message],
+        ctx: Optional[RequestContext],
+        session_id: Optional[str],
+        archive_uri: str,
+        strict_extract_errors: bool,
+    ) -> list[Context]:
+        if ctx is None:
+            logger.warning("No RequestContext provided, skipping training case fast path")
+            return []
+        case_result = await self._write_training_case_memory(
+            case=case,
+            ctx=ctx,
+            archive_uri=archive_uri,
+        )
+        contexts = _contexts_from_update_result(case_result)
+        await self.train_from_extracted_cases(
+            cases=[case],
+            messages=list(messages[1:]),
+            ctx=ctx,
+            session_id=session_id,
+            archive_uri=archive_uri,
+            strict_extract_errors=strict_extract_errors,
+        )
+        return contexts
+
+    @tracer("train.compressor_v3.fast_path.write_case", ignore_result=True, ignore_args=True)
+    async def _write_training_case_memory(
+        self,
+        *,
+        case: Case,
+        ctx: RequestContext,
+        archive_uri: str,
+    ) -> Any:
+        viking_fs = get_viking_fs()
+        registry = create_default_registry()
+        schema = registry.get(_CASES_MEMORY_TYPE)
+        if schema is None or not schema.enabled:
+            raise RuntimeError("cases memory schema is not available")
+
+        extract_context = ExtractContext([])
+        fields = _case_to_memory_fields(case)
+        uri = generate_uri(
+            memory_type=schema,
+            fields=fields,
+            user_space=getattr(getattr(ctx, "user", None), "user_id", None) or "default",
+            extract_context=extract_context,
+        )
+        old_file = None
+        try:
+            raw = await viking_fs.read_file(uri, ctx=ctx)
+            if raw:
+                old_file = MemoryFileUtils.read(raw, uri=uri)
+        except Exception:
+            old_file = None
+
+        source = MemoryOperationSource(
+            extraction_id=(archive_uri.rstrip("/").rsplit("/", 1)[-1] if archive_uri else ""),
+            archive_uri=archive_uri or None,
+            trace_id=tracer.get_trace_id() or None,
+        )
+        operations = ResolvedOperations(
+            upsert_operations=[
+                ResolvedOperation(
+                    old_memory_file_content=old_file,
+                    memory_fields=fields,
+                    memory_type=_CASES_MEMORY_TYPE,
+                    uris=[uri],
+                    source=source,
+                )
+            ],
+            delete_file_contents=[],
+            errors=[],
+        )
+        updater = self._get_or_create_updater(registry, transaction_handle=None)
+        result = await updater.apply_operations(
+            operations,
+            ctx,
+            extract_context=extract_context,
+            isolation_handler=MemoryIsolationHandler(
+                ctx,
+                extract_context,
+                allowed_memory_types={_CASES_MEMORY_TYPE},
+            ),
+        )
+        if archive_uri:
+            memory_diff = await self._build_memory_diff(
+                result=result,
+                operations=operations,
+                viking_fs=viking_fs,
+                ctx=ctx,
+                archive_uri=archive_uri,
+            )
+            await viking_fs.write_file(
+                uri=f"{archive_uri.rstrip('/')}/memory_diff.json",
+                content=json.dumps(memory_diff, ensure_ascii=False, indent=4),
+                ctx=ctx,
+            )
+        tracer.info(
+            "Training CaseSpec fast path wrote case memory: "
+            f"case={case.name} uri={uri} written={result.written_uris} edited={result.edited_uris}"
+        )
+        return result
 
     @tracer(
         "train.compressor_v3.extract_user_memories", ignore_result=True, ignore_args=True
@@ -447,6 +573,165 @@ def _contexts_from_update_result(result: Any) -> list[Context]:
     for uri in result.deleted_uris:
         contexts.append(Context(uri=uri, category="memory_delete", context_type="memory"))
     return contexts
+
+
+def _training_case_from_first_message(
+    messages: list[Message],
+    allowed_memory_types: Optional[set[str]],
+) -> Case | None:
+    """Parse a batch-training CaseSpec control message from message[0].
+
+    The fast path is deliberately gated by the commit memory policy so normal
+    user sessions never bypass user-memory extraction.  Once the protocol
+    header is present, malformed payloads are treated as errors instead of
+    silently falling back to LLM extraction.
+    """
+    if not messages or allowed_memory_types is None:
+        return None
+    if not set(allowed_memory_types).issubset(_TRAINING_FAST_PATH_MEMORY_TYPES):
+        return None
+
+    text = _message_text(messages[0]).strip()
+    if not text.startswith(_TRAINING_CASE_SPEC_HEADER):
+        return None
+    payload = _parse_training_case_spec_payload(text)
+    return _case_from_payload(payload)
+
+
+def _message_text(message: Message) -> str:
+    content = getattr(message, "content", "")
+    if content:
+        return str(content)
+    texts: list[str] = []
+    for part in getattr(message, "parts", []) or []:
+        text = getattr(part, "text", None)
+        if text:
+            texts.append(str(text))
+    return "\n".join(texts)
+
+
+def _parse_training_case_spec_payload(text: str) -> dict[str, Any]:
+    match = _JSON_FENCE_RE.search(text)
+    raw_payload = (
+        match.group(1).strip()
+        if match
+        else text.removeprefix(_TRAINING_CASE_SPEC_HEADER).strip()
+    )
+    if not raw_payload:
+        raise ValueError("Training CaseSpec fast path payload is empty")
+    try:
+        payload = JsonUtils.loads(raw_payload)
+    except Exception as exc:
+        raise ValueError("Training CaseSpec fast path payload is not valid JSON") from exc
+    if not isinstance(payload, dict):
+        raise ValueError("Training CaseSpec fast path payload must be a JSON object")
+    protocol = str(payload.get("protocol") or "")
+    if protocol != _TRAINING_CASE_SPEC_PROTOCOL:
+        raise ValueError(
+            "Training CaseSpec fast path protocol mismatch: "
+            f"expected {_TRAINING_CASE_SPEC_PROTOCOL!r}, got {protocol!r}"
+        )
+    if not isinstance(payload.get("case"), dict):
+        raise ValueError("Training CaseSpec fast path payload must contain a case object")
+    return payload
+
+
+def _case_from_payload(payload: dict[str, Any]) -> Case:
+    raw_case = payload["case"]
+    name = str(raw_case.get("name") or "").strip()
+    task_signature = str(raw_case.get("task_signature") or "").strip()
+    if not name:
+        raise ValueError("Training CaseSpec case.name is required")
+    if not task_signature:
+        raise ValueError("Training CaseSpec case.task_signature is required")
+    case_input = raw_case.get("input")
+    if not isinstance(case_input, dict):
+        raise ValueError("Training CaseSpec case.input must be an object")
+    rubric = _rubric_from_payload(raw_case.get("rubric"), fallback_name=f"{name}_rubric")
+    metadata = raw_case.get("metadata") if isinstance(raw_case.get("metadata"), dict) else {}
+    return Case(
+        name=name,
+        task_signature=task_signature,
+        input=dict(case_input),
+        rubric=rubric,
+        metadata={
+            "source": "batch_training_case_spec",
+            **dict(metadata),
+        },
+    )
+
+
+def _rubric_from_payload(raw_rubric: Any, *, fallback_name: str) -> Rubric:
+    if not isinstance(raw_rubric, dict):
+        raise ValueError("Training CaseSpec case.rubric must be an object")
+    raw_criteria = raw_rubric.get("criteria")
+    if not isinstance(raw_criteria, list) or not raw_criteria:
+        raise ValueError("Training CaseSpec case.rubric.criteria must be a non-empty list")
+
+    criteria: list[RubricCriterion] = []
+    for index, item in enumerate(raw_criteria):
+        if not isinstance(item, dict):
+            raise ValueError("Training CaseSpec rubric criteria must be objects")
+        name = str(item.get("name") or f"criterion_{index + 1}").strip()
+        description = str(item.get("description") or "").strip()
+        if not description:
+            raise ValueError("Training CaseSpec rubric criterion.description is required")
+        criteria.append(
+            RubricCriterion(
+                name=name,
+                description=description,
+                required=bool(item.get("required", True)),
+                weight=_safe_weight(item.get("weight"), default=1.0),
+                metadata=dict(item.get("metadata") or {})
+                if isinstance(item.get("metadata"), dict)
+                else {},
+            )
+        )
+
+    return Rubric(
+        name=str(raw_rubric.get("name") or fallback_name),
+        description=str(
+            raw_rubric.get("description")
+            or "Defines what good means for this batch training case."
+        ),
+        criteria=criteria,
+        metadata=dict(raw_rubric.get("metadata") or {})
+        if isinstance(raw_rubric.get("metadata"), dict)
+        else {},
+    )
+
+
+def _case_to_memory_fields(case: Case) -> dict[str, Any]:
+    return {
+        "case_name": case.name,
+        "task_signature": case.task_signature,
+        "input": json.dumps(case.input or {}, ensure_ascii=False, sort_keys=True),
+        "rubric": json.dumps(_rubric_to_payload(case.rubric), ensure_ascii=False, sort_keys=True),
+        "evidence": _case_evidence(case),
+    }
+
+
+def _rubric_to_payload(rubric: Rubric) -> dict[str, Any]:
+    return {
+        "name": rubric.name,
+        "description": rubric.description,
+        "criteria": [
+            {
+                "name": criterion.name,
+                "description": criterion.description,
+                "required": criterion.required,
+                "weight": criterion.weight,
+            }
+            for criterion in rubric.criteria
+        ],
+    }
+
+
+def _case_evidence(case: Case) -> str:
+    raw_evidence = (case.metadata or {}).get("evidence")
+    if raw_evidence:
+        return str(raw_evidence)
+    return "Structured batch training CaseSpec supplied by the training pipeline."
 
 
 def _operations_to_cases(operations: ResolvedOperations) -> list[Case]:

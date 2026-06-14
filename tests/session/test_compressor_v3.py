@@ -14,7 +14,14 @@ from openviking.session import create_session_compressor
 from openviking.session.compressor_v3 import SessionCompressorV3
 from openviking.session.memory.dataclass import ResolvedOperation, ResolvedOperations
 from openviking.session.memory.memory_updater import MemoryUpdateResult
-from openviking.session.train import StreamingPolicyTrainerConfig
+from openviking.session.train import (
+    Case,
+    Rollout,
+    Rubric,
+    RubricCriterion,
+    StreamingPolicyTrainerConfig,
+)
+from openviking.session.train.components.session_commit import _case_spec_message_to_request
 from openviking_cli.session.user_id import UserIdentifier
 
 
@@ -166,3 +173,135 @@ async def test_v3_extract_uses_patch_merge_without_directory_lock(monkeypatch):
     assert applied_operations[0].upsert_operations[0].memory_type == "cases"
     assert [case.name for case in trained_cases] == ["重复预订处理"]
     assert contexts[0].uri.endswith("重复预订处理.md")
+
+
+
+def _training_case() -> Case:
+    return Case(
+        name="duplicate_booking",
+        task_signature="Handle duplicate bookings safely.",
+        input={"summary": "cancel only the duplicate booking", "task_id": "task-1"},
+        rubric=Rubric(
+            name="duplicate_booking_rubric",
+            description="Verify duplicates before cancellation.",
+            criteria=[
+                RubricCriterion(
+                    name="verify_duplicate",
+                    description="The assistant verifies which booking is the duplicate before acting.",
+                    required=True,
+                    weight=1.0,
+                )
+            ],
+        ),
+        metadata={"evidence": "The rollout contains duplicate-booking handling evidence."},
+    )
+
+
+def _case_spec_message(case: Case | None = None) -> Message:
+    rollout = Rollout(
+        case=case or _training_case(),
+        messages=[],
+        policy_snapshot_id="snapshot-1",
+    )
+    request = _case_spec_message_to_request(rollout)
+    return Message(
+        id="case-spec",
+        role="user",
+        parts=[TextPart(text=request["parts"][0]["text"])],
+    )
+
+
+@pytest.mark.asyncio
+async def test_v3_training_case_spec_fast_path_skips_user_memory_extraction_and_strips_control_message():
+    case_spec = _case_spec_message()
+    rollout_messages = _messages()
+    written = []
+    trained = []
+
+    compressor = SessionCompressorV3(vikingdb=None, rollout_analyzer=SimpleNamespace())
+
+    async def fail_extract_user_memories(**kwargs):
+        raise AssertionError("fast path must not run LLM user-memory extraction")
+
+    async def fake_write_training_case_memory(**kwargs):
+        written.append(kwargs["case"])
+        result = MemoryUpdateResult()
+        result.add_written("viking://user/u/memories/cases/duplicate_booking.md")
+        return result
+
+    async def fake_train_from_extracted_cases(**kwargs):
+        trained.append(kwargs)
+        return {"case_count": len(kwargs["cases"]), "submitted": len(kwargs["cases"])}
+
+    compressor._extract_user_memories = fail_extract_user_memories
+    compressor._write_training_case_memory = fake_write_training_case_memory
+    compressor.train_from_extracted_cases = fake_train_from_extracted_cases
+
+    contexts = await compressor.extract_long_term_memories(
+        messages=[case_spec, *rollout_messages],
+        ctx=_ctx(),
+        session_id="s1",
+        archive_uri="viking://user/u/sessions/s1/history/archive_001",
+        allowed_memory_types={"cases", "trajectories", "experiences"},
+    )
+
+    assert [case.name for case in written] == ["duplicate_booking"]
+    assert [case.name for case in trained[0]["cases"]] == ["duplicate_booking"]
+    assert trained[0]["messages"] == rollout_messages
+    assert contexts[0].uri == "viking://user/u/memories/cases/duplicate_booking.md"
+
+
+@pytest.mark.asyncio
+async def test_v3_training_case_spec_fast_path_not_used_with_user_memory_policy():
+    extracted = False
+    trained = []
+
+    compressor = SessionCompressorV3(vikingdb=None, rollout_analyzer=SimpleNamespace())
+
+    async def fake_extract_user_memories(**kwargs):
+        nonlocal extracted
+        extracted = True
+        return SimpleNamespace(contexts=[], cases=[])
+
+    async def fake_train_from_extracted_cases(**kwargs):
+        trained.append(kwargs)
+        return {"case_count": 0, "submitted": 0}
+
+    compressor._extract_user_memories = fake_extract_user_memories
+    compressor.train_from_extracted_cases = fake_train_from_extracted_cases
+
+    contexts = await compressor.extract_long_term_memories(
+        messages=[_case_spec_message(), *_messages()],
+        ctx=_ctx(),
+        allowed_memory_types={"cases", "profile"},
+    )
+
+    assert contexts == []
+    assert extracted is True
+    assert trained and trained[0]["messages"][0].id == "case-spec"
+
+
+@pytest.mark.asyncio
+async def test_v3_training_case_spec_fast_path_rejects_invalid_protocol():
+    message = _case_spec_message()
+    message.parts[0].text = message.parts[0].text.replace(
+        "openviking.batch_train.case_spec.v1",
+        "openviking.batch_train.case_spec.v0",
+    )
+    compressor = SessionCompressorV3(vikingdb=None, rollout_analyzer=SimpleNamespace())
+
+    with pytest.raises(ValueError, match="protocol mismatch"):
+        await compressor.extract_long_term_memories(
+            messages=[message, *_messages()],
+            ctx=_ctx(),
+            allowed_memory_types={"cases", "trajectories", "experiences"},
+        )
+
+
+def test_training_case_spec_message_uses_fast_path_protocol():
+    message = _case_spec_message()
+    text = message.content
+
+    assert text.startswith("# OpenViking Batch Training CaseSpec v1")
+    assert "openviking.batch_train.case_spec.v1" in text
+    assert '"name": "duplicate_booking_rubric"' in text
