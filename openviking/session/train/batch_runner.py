@@ -48,7 +48,6 @@ class BatchTrainEvalConfig:
     output_path: str | None = None
     keep_default_tools: bool = True
     max_iterations: int = 30
-    rollout_backend: str = "native"
     server_url: str | None = None
     api_key: str | None = None
     account_id: str = "default"
@@ -80,8 +79,6 @@ class BatchTrainEvalConfig:
             raise ValueError("concurrency must be > 0")
         if self.max_iterations <= 0:
             raise ValueError("max_iterations must be > 0")
-        if self.rollout_backend not in {"native", "vikingbot"}:
-            raise ValueError("rollout_backend must be native or vikingbot")
         if self.commit_poll_interval_seconds <= 0:
             raise ValueError("commit_poll_interval_seconds must be > 0")
         if self.commit_timeout_seconds is not None and self.commit_timeout_seconds <= 0:
@@ -193,7 +190,6 @@ async def run_batch_train_eval(config: BatchTrainEvalConfig) -> BatchTrainEvalRe
             train_limit=config.train_limit,
             eval_limit=config.eval_limit,
             trials=config.trials,
-            rollout_backend=config.rollout_backend,
             clean_result=config.clean_result,
         )
         policy_trainer = SessionCommitPolicyTrainer(
@@ -349,7 +345,6 @@ async def run_batch_train_eval(config: BatchTrainEvalConfig) -> BatchTrainEvalRe
                 "domain": config.domain,
                 "epochs": config.epochs,
                 "trials": config.trials,
-                "rollout_backend": config.rollout_backend,
                 "run_id": policy_trainer.run_id,
                 "trace_id": report.trace_id,
             },
@@ -428,7 +423,6 @@ def _build_pipeline(
                 "config_path": config.config_path,
                 "keep_default_tools": config.keep_default_tools,
                 "max_iterations": config.max_iterations,
-                "rollout_backend": config.rollout_backend,
             },
         ),
         rollout_analyzer=UnusedRolloutAnalyzer(),

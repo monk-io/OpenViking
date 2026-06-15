@@ -16,10 +16,18 @@ from openviking.session.memory.dataclass import ResolvedOperation, ResolvedOpera
 from openviking.session.memory.memory_updater import MemoryUpdateResult
 from openviking.session.train import (
     Case,
+    ExperienceSet,
+    PolicyApplyResult,
+    PolicyUpdatePlan,
+    PolicyPlanItem,
     Rollout,
+    RolloutAnalysis,
+    RolloutTrainingResult,
     Rubric,
+    RubricEvaluation,
     RubricCriterion,
     StreamingPolicyTrainerConfig,
+    Trajectory,
 )
 from openviking.session.train.components.session_commit import _case_spec_message_to_request
 from openviking_cli.session.user_id import UserIdentifier
@@ -305,3 +313,169 @@ def test_training_case_spec_message_uses_fast_path_protocol():
     assert text.startswith("# OpenViking Batch Training CaseSpec v1")
     assert "openviking.batch_train.case_spec.v1" in text
     assert '"name": "duplicate_booking_rubric"' in text
+
+
+@pytest.mark.asyncio
+async def test_v3_fast_path_writes_final_memory_diff_with_case_traj_and_exp(monkeypatch):
+    archive_uri = "viking://user/u/sessions/s1/history/archive_001"
+    writes: dict[str, str] = {}
+
+    class FakeFS:
+        async def write_file(self, uri, content, ctx=None):
+            del ctx
+            writes[uri] = content
+
+        async def read_file(self, uri, ctx=None):
+            del ctx
+            if uri.endswith("/cases/duplicate_booking.md"):
+                return "# duplicate_booking\n\n<!-- MEMORY_FIELDS\n{}\n-->"
+            if uri.endswith("/experiences/booking_duplicate_handling.md"):
+                return "new exp content\n\n<!-- MEMORY_FIELDS\n{}\n-->"
+            raise FileNotFoundError(uri)
+
+    compressor = SessionCompressorV3(vikingdb=None, rollout_analyzer=SimpleNamespace())
+
+    async def fake_write_training_case_memory(**kwargs):
+        result = MemoryUpdateResult()
+        result.add_written("viking://user/u/memories/cases/duplicate_booking.md")
+        return SimpleNamespace(
+            result=result,
+            memory_diff={
+                "archive_uri": archive_uri,
+                "trace_id": None,
+                "extracted_at": "now",
+                "operations": {
+                    "adds": [
+                        {
+                            "uri": "viking://user/u/memories/cases/duplicate_booking.md",
+                            "memory_type": "cases",
+                            "after": "# duplicate_booking",
+                        }
+                    ],
+                    "updates": [],
+                    "deletes": [],
+                },
+                "summary": {"total_adds": 1, "total_updates": 0, "total_deletes": 0},
+            },
+        )
+
+    async def fake_train_from_extracted_cases(**kwargs):
+        return {
+            "case_count": 1,
+            "submitted": 1,
+            "memory_diff": {
+                "archive_uri": archive_uri,
+                "trace_id": None,
+                "extracted_at": "now",
+                "operations": {
+                    "adds": [
+                        {
+                            "uri": "viking://user/u/memories/trajectories/duplicate_booking.md",
+                            "memory_type": "trajectories",
+                            "after": "trajectory content",
+                        }
+                    ],
+                    "updates": [
+                        {
+                            "uri": "viking://user/u/memories/experiences/booking_duplicate_handling.md",
+                            "memory_type": "experiences",
+                            "before": "old exp content",
+                            "after": "new exp content",
+                        }
+                    ],
+                    "deletes": [],
+                },
+                "summary": {"total_adds": 1, "total_updates": 1, "total_deletes": 0},
+            },
+        }
+
+    compressor._write_training_case_memory = fake_write_training_case_memory
+    compressor.train_from_extracted_cases = fake_train_from_extracted_cases
+    monkeypatch.setattr("openviking.session.compressor_v3.get_viking_fs", lambda: FakeFS())
+
+    contexts = await compressor.extract_long_term_memories(
+        messages=[_case_spec_message(), *_messages()],
+        ctx=_ctx(),
+        session_id="s1",
+        archive_uri=archive_uri,
+        allowed_memory_types={"cases", "trajectories", "experiences"},
+    )
+
+    assert contexts[0].uri.endswith("/cases/duplicate_booking.md")
+    diff = __import__("json").loads(writes[f"{archive_uri}/memory_diff.json"])
+    assert [item["memory_type"] for item in diff["operations"]["adds"]] == [
+        "cases",
+        "trajectories",
+    ]
+    assert [item["memory_type"] for item in diff["operations"]["updates"]] == ["experiences"]
+    assert diff["summary"] == {"total_adds": 2, "total_updates": 1, "total_deletes": 0}
+
+
+@pytest.mark.asyncio
+async def test_v3_builds_training_memory_diff_from_streaming_result(monkeypatch):
+    archive_uri = "viking://user/u/sessions/s1/history/archive_001"
+
+    class FakeFS:
+        async def read_file(self, uri, ctx=None):
+            del ctx
+            assert uri.endswith("/experiences/booking_duplicate_handling.md")
+            return "new exp content\n\n<!-- MEMORY_FIELDS\n{}\n-->"
+
+    compressor = SessionCompressorV3(vikingdb=None, rollout_analyzer=SimpleNamespace())
+    plan = PolicyUpdatePlan(
+        items=[
+            PolicyPlanItem(
+                kind="upsert_experience",
+                target_experience_name="booking_duplicate_handling",
+                target_experience_uri="viking://user/u/memories/experiences/booking_duplicate_handling.md",
+                before_content="old exp content",
+                after_content="new exp content fallback",
+            )
+        ]
+    )
+    training_result = RolloutTrainingResult(
+        analyses=[
+            RolloutAnalysis(
+                evaluation=RubricEvaluation(
+                    passed=True,
+                    score=1.0,
+                    criterion_results=[],
+                    feedback=[],
+                ),
+                trajectories=[
+                    Trajectory(
+                        name="duplicate_booking",
+                        uri="viking://user/u/memories/trajectories/duplicate_booking.md",
+                        content="trajectory content",
+                        outcome="success",
+                        retrieval_anchor="Stage: final",
+                    )
+                ],
+            )
+        ],
+        gradients=[],
+        plan=plan,
+        apply_result=PolicyApplyResult(
+            updated_policy_set=ExperienceSet(
+                root_uri="viking://user/u/memories/experiences",
+                policies=[],
+            ),
+            written_uris=[
+                "viking://user/u/memories/experiences/booking_duplicate_handling.md"
+            ],
+        ),
+    )
+
+    diff = await compressor._build_training_memory_diff(
+        training_result=training_result,
+        viking_fs=FakeFS(),
+        ctx=_ctx(),
+        archive_uri=archive_uri,
+    )
+
+    assert diff["summary"] == {"total_adds": 1, "total_updates": 1, "total_deletes": 0}
+    assert diff["operations"]["adds"][0]["memory_type"] == "trajectories"
+    update = diff["operations"]["updates"][0]
+    assert update["memory_type"] == "experiences"
+    assert update["before"] == "old exp content"
+    assert update["after"] == "new exp content"

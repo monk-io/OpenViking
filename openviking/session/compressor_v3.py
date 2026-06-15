@@ -203,17 +203,12 @@ class SessionCompressorV3:
             except Exception:
                 pass
 
-        return {
-            "archive_uri": archive_uri,
-            "trace_id": tracer.get_trace_id() or None,
-            "extracted_at": datetime.utcnow().isoformat() + "Z",
-            "operations": {"adds": adds, "updates": updates, "deletes": deletes},
-            "summary": {
-                "total_adds": len(adds),
-                "total_updates": len(updates),
-                "total_deletes": len(deletes),
-            },
-        }
+        return _make_memory_diff(
+            archive_uri=archive_uri,
+            adds=adds,
+            updates=updates,
+            deletes=deletes,
+        )
 
     @tracer(ignore_result=True)
     async def extract_long_term_memories(
@@ -254,13 +249,22 @@ class SessionCompressorV3:
             allow_self_memory=allow_self_memory,
             allowed_peer_ids=allowed_peer_ids,
         )
-        await self.train_from_extracted_cases(
+        train_result = await self.train_from_extracted_cases(
             cases=result.cases,
             messages=message_list,
             ctx=ctx,
             session_id=session_id,
             archive_uri=archive_uri or "",
             strict_extract_errors=strict_extract_errors,
+            collect_memory_diff=True,
+        )
+        await self._write_final_memory_diff(
+            archive_uri=archive_uri or "",
+            ctx=ctx,
+            memory_diffs=[
+                getattr(result, "memory_diff", None),
+                _dict_value(train_result, "memory_diff"),
+            ],
         )
         return result.contexts
 
@@ -277,19 +281,29 @@ class SessionCompressorV3:
         if ctx is None:
             logger.warning("No RequestContext provided, skipping training case fast path")
             return []
-        case_result = await self._write_training_case_memory(
+        case_write = await self._write_training_case_memory(
             case=case,
             ctx=ctx,
             archive_uri=archive_uri,
         )
+        case_result = _applied_memory_result(case_write)
         contexts = _contexts_from_update_result(case_result)
-        await self.train_from_extracted_cases(
+        train_result = await self.train_from_extracted_cases(
             cases=[case],
             messages=list(messages[1:]),
             ctx=ctx,
             session_id=session_id,
             archive_uri=archive_uri,
             strict_extract_errors=strict_extract_errors,
+            collect_memory_diff=True,
+        )
+        await self._write_final_memory_diff(
+            archive_uri=archive_uri,
+            ctx=ctx,
+            memory_diffs=[
+                _applied_memory_diff(case_write),
+                _dict_value(train_result, "memory_diff"),
+            ],
         )
         return contexts
 
@@ -352,6 +366,7 @@ class SessionCompressorV3:
                 allowed_memory_types={_CASES_MEMORY_TYPE},
             ),
         )
+        memory_diff = None
         if archive_uri:
             memory_diff = await self._build_memory_diff(
                 result=result,
@@ -360,16 +375,11 @@ class SessionCompressorV3:
                 ctx=ctx,
                 archive_uri=archive_uri,
             )
-            await viking_fs.write_file(
-                uri=f"{archive_uri.rstrip('/')}/memory_diff.json",
-                content=json.dumps(memory_diff, ensure_ascii=False, indent=4),
-                ctx=ctx,
-            )
         tracer.info(
             "Training CaseSpec fast path wrote case memory: "
             f"case={case.name} uri={uri} written={result.written_uris} edited={result.edited_uris}"
         )
-        return result
+        return _V3AppliedMemory(result=result, operations=operations, memory_diff=memory_diff)
 
     @tracer(
         "train.compressor_v3.extract_user_memories", ignore_result=True, ignore_args=True
@@ -460,6 +470,7 @@ class SessionCompressorV3:
         result = update_result.apply_result
         patch_operations = update_result.operations
 
+        memory_diff = None
         if archive_uri and viking_fs and result is not None:
             memory_diff = await self._build_memory_diff(
                 result=result,
@@ -468,14 +479,13 @@ class SessionCompressorV3:
                 ctx=ctx,
                 archive_uri=archive_uri,
             )
-            await viking_fs.write_file(
-                uri=f"{archive_uri}/memory_diff.json",
-                content=json.dumps(memory_diff, ensure_ascii=False, indent=4),
-                ctx=ctx,
-            )
 
         contexts = _contexts_from_update_result(result)
-        return _V3ExtractionResult(contexts=contexts, cases=extracted_cases)
+        return _V3ExtractionResult(
+            contexts=contexts,
+            cases=extracted_cases,
+            memory_diff=memory_diff,
+        )
 
     @tracer("train.compressor_v3.train_from_extracted_cases", ignore_result=True, ignore_args=True)
     async def train_from_extracted_cases(
@@ -487,6 +497,7 @@ class SessionCompressorV3:
         session_id: Optional[str] = None,
         archive_uri: str = "",
         strict_extract_errors: bool = False,
+        collect_memory_diff: bool = False,
     ) -> dict[str, Any]:
         if not messages or ctx is None:
             return {"case_count": 0, "submitted": 0, "reason": "missing_messages_or_ctx"}
@@ -534,6 +545,7 @@ class SessionCompressorV3:
                 config=self.streaming_trainer_config,
             )
             submitted = 0
+            memory_diffs: list[dict[str, Any]] = []
             for case in cases:
                 rollout = Rollout(
                     case=case,
@@ -543,25 +555,148 @@ class SessionCompressorV3:
                         archive_uri=archive_uri,
                     ),
                 )
-                await trainer.submit_rollout(rollout)
+                training_result = await trainer.submit_rollout(rollout)
                 submitted += 1
+                if collect_memory_diff:
+                    memory_diff = await self._build_training_memory_diff(
+                        training_result=training_result,
+                        viking_fs=viking_fs,
+                        ctx=ctx,
+                        archive_uri=archive_uri,
+                    )
+                    if _memory_diff_has_changes(memory_diff):
+                        memory_diffs.append(memory_diff)
             tracer.info(
                 "Submitted commit case memories to streaming train: "
                 f"case_count={len(cases)} submitted={submitted}",
                 console=self.streaming_trainer_config.trace_console,
             )
-            return {"case_count": len(cases), "submitted": submitted}
+            response: dict[str, Any] = {"case_count": len(cases), "submitted": submitted}
+            if collect_memory_diff:
+                response["memory_diff"] = _merge_memory_diffs(
+                    memory_diffs,
+                    archive_uri=archive_uri,
+                )
+            return response
         except Exception as exc:
             logger.warning("Commit streaming train failed: %s", exc, exc_info=True)
             if strict_extract_errors:
                 raise
             return {"case_count": len(cases), "submitted": 0, "error": str(exc)}
 
+    async def _build_training_memory_diff(
+        self,
+        *,
+        training_result: Any,
+        viking_fs: Any,
+        ctx: RequestContext,
+        archive_uri: str,
+    ) -> dict[str, Any]:
+        adds: list[dict[str, Any]] = []
+        updates: list[dict[str, Any]] = []
+        deletes: list[dict[str, Any]] = []
+
+        seen_trajectory_uris: set[str] = set()
+        for analysis in getattr(training_result, "analyses", []) or []:
+            for trajectory in getattr(analysis, "trajectories", []) or []:
+                uri = str(getattr(trajectory, "uri", "") or "")
+                if not uri or uri in seen_trajectory_uris:
+                    continue
+                seen_trajectory_uris.add(uri)
+                adds.append(
+                    {
+                        "uri": uri,
+                        "memory_type": "trajectories",
+                        "after": str(getattr(trajectory, "content", "") or ""),
+                    }
+                )
+
+        apply_result = getattr(training_result, "apply_result", None)
+        plan = getattr(training_result, "plan", None)
+        applied_uris = set(getattr(apply_result, "written_uris", []) or [])
+        deleted_uris = set(getattr(apply_result, "deleted_uris", []) or [])
+        policy_set = getattr(apply_result, "updated_policy_set", None)
+        root_uri = str(getattr(policy_set, "root_uri", "") or _experience_root_uri(ctx))
+
+        for item in getattr(plan, "items", []) or []:
+            uri = _experience_plan_item_uri(item, root_uri)
+            if not uri:
+                continue
+            if getattr(item, "kind", None) == "delete_experience":
+                if uri in deleted_uris:
+                    deletes.append(
+                        {
+                            "uri": uri,
+                            "memory_type": "experiences",
+                            "deleted_content": str(getattr(item, "before_content", "") or ""),
+                        }
+                    )
+                continue
+            if getattr(item, "kind", None) != "upsert_experience" or uri not in applied_uris:
+                continue
+            after = await _read_plain_memory_content(
+                viking_fs,
+                uri=uri,
+                ctx=ctx,
+                fallback=str(getattr(item, "after_content", "") or ""),
+            )
+            before = getattr(item, "before_content", None)
+            if before is None:
+                adds.append({"uri": uri, "memory_type": "experiences", "after": after})
+            else:
+                updates.append(
+                    {
+                        "uri": uri,
+                        "memory_type": "experiences",
+                        "before": str(before),
+                        "after": after,
+                    }
+                )
+
+        return _make_memory_diff(
+            archive_uri=archive_uri,
+            adds=adds,
+            updates=updates,
+            deletes=deletes,
+        )
+
+    async def _write_final_memory_diff(
+        self,
+        *,
+        archive_uri: str,
+        ctx: Optional[RequestContext],
+        memory_diffs: list[Any],
+    ) -> None:
+        if not archive_uri or ctx is None:
+            return
+        merged = _merge_memory_diffs(
+            [diff for diff in memory_diffs if isinstance(diff, dict)],
+            archive_uri=archive_uri,
+        )
+        if not _memory_diff_has_changes(merged):
+            return
+        viking_fs = get_viking_fs()
+        if viking_fs is None:
+            return
+        await viking_fs.write_file(
+            uri=f"{archive_uri.rstrip('/')}/memory_diff.json",
+            content=json.dumps(merged, ensure_ascii=False, indent=4),
+            ctx=ctx,
+        )
+
 
 @dataclass(slots=True)
 class _V3ExtractionResult:
     contexts: list[Context] = field(default_factory=list)
     cases: list[Case] = field(default_factory=list)
+    memory_diff: dict[str, Any] | None = None
+
+
+@dataclass(slots=True)
+class _V3AppliedMemory:
+    result: Any
+    operations: ResolvedOperations
+    memory_diff: dict[str, Any] | None = None
 
 
 def _contexts_from_update_result(result: Any) -> list[Context]:
@@ -847,6 +982,122 @@ def _get_memory_type_from_uri(uri: str) -> str:
 def _experience_root_uri(ctx: RequestContext) -> str:
     user_space = getattr(getattr(ctx, "user", None), "user_id", None) or "default"
     return f"viking://user/{user_space}/memories/experiences"
+
+
+def _dict_value(data: Any, key: str) -> Any:
+    if isinstance(data, dict):
+        return data.get(key)
+    return None
+
+
+def _applied_memory_result(value: Any) -> Any:
+    if isinstance(value, _V3AppliedMemory):
+        return value.result
+    result = getattr(value, "result", None)
+    return result if result is not None else value
+
+
+def _applied_memory_diff(value: Any) -> dict[str, Any] | None:
+    if isinstance(value, _V3AppliedMemory):
+        return value.memory_diff
+    memory_diff = getattr(value, "memory_diff", None)
+    return memory_diff if isinstance(memory_diff, dict) else None
+
+
+def _make_memory_diff(
+    *,
+    archive_uri: str,
+    adds: list[dict[str, Any]],
+    updates: list[dict[str, Any]],
+    deletes: list[dict[str, Any]],
+) -> dict[str, Any]:
+    return {
+        "archive_uri": archive_uri,
+        "trace_id": tracer.get_trace_id() or None,
+        "extracted_at": datetime.utcnow().isoformat() + "Z",
+        "operations": {
+            "adds": list(adds),
+            "updates": list(updates),
+            "deletes": list(deletes),
+        },
+        "summary": {
+            "total_adds": len(adds),
+            "total_updates": len(updates),
+            "total_deletes": len(deletes),
+        },
+    }
+
+
+def _merge_memory_diffs(
+    diffs: list[dict[str, Any]],
+    *,
+    archive_uri: str,
+) -> dict[str, Any]:
+    adds: list[dict[str, Any]] = []
+    updates: list[dict[str, Any]] = []
+    deletes: list[dict[str, Any]] = []
+    trace_id = tracer.get_trace_id() or None
+    for diff in diffs:
+        if not isinstance(diff, dict):
+            continue
+        if trace_id is None and diff.get("trace_id"):
+            trace_id = str(diff.get("trace_id"))
+        operations = diff.get("operations")
+        if not isinstance(operations, dict):
+            continue
+        adds.extend([item for item in operations.get("adds", []) if isinstance(item, dict)])
+        updates.extend([item for item in operations.get("updates", []) if isinstance(item, dict)])
+        deletes.extend([item for item in operations.get("deletes", []) if isinstance(item, dict)])
+    merged = _make_memory_diff(
+        archive_uri=archive_uri,
+        adds=adds,
+        updates=updates,
+        deletes=deletes,
+    )
+    merged["trace_id"] = trace_id
+    return merged
+
+
+def _memory_diff_has_changes(diff: Any) -> bool:
+    if not isinstance(diff, dict):
+        return False
+    summary = diff.get("summary")
+    if not isinstance(summary, dict):
+        return False
+    return any(
+        int(summary.get(key) or 0) > 0
+        for key in ("total_adds", "total_updates", "total_deletes")
+    )
+
+
+async def _read_plain_memory_content(
+    viking_fs: Any,
+    *,
+    uri: str,
+    ctx: RequestContext,
+    fallback: str,
+) -> str:
+    try:
+        raw = await viking_fs.read_file(uri, ctx=ctx)
+        return MemoryFileUtils.read(raw, uri=uri).content
+    except Exception:
+        return fallback
+
+
+def _experience_plan_item_uri(item: Any, root_uri: str) -> str:
+    uri = str(getattr(item, "target_experience_uri", "") or "")
+    if uri:
+        return uri
+    name = str(getattr(item, "target_experience_name", "") or "new_experience")
+    return f"{root_uri.rstrip('/')}/{_safe_experience_filename(name)}.md"
+
+
+_EXPERIENCE_NAME_RE = re.compile(r"[^a-zA-Z0-9_.-]+")
+
+
+def _safe_experience_filename(name: str) -> str:
+    filename = _EXPERIENCE_NAME_RE.sub("_", name.strip()).strip("._-")
+    return filename or "new_experience"
 
 
 def _commit_policy_snapshot_id(*, session_id: Optional[str], archive_uri: str) -> str:

@@ -59,12 +59,6 @@ def parse_args() -> argparse.Namespace:
         help="Max steps/iterations per rollout (default: 30)",
     )
     parser.add_argument(
-        "--rollout-backend",
-        choices=["native", "vikingbot"],
-        default="native",
-        help="Benchmark rollout implementation backend (default: native).",
-    )
-    parser.add_argument(
         "--train-limit",
         type=int,
         default=None,
@@ -133,7 +127,6 @@ async def main_async() -> int:
             events_path=args.events_output,
             keep_default_tools=True,
             max_iterations=args.max_iterations,
-            rollout_backend=args.rollout_backend,
             train_limit=args.train_limit,
             eval_limit=args.eval_limit,
             benchmark_service_url=args.benchmark_service_url,
