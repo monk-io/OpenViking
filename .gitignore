@@ -210,3 +210,6 @@ tests/integration/.tmp_*/
 .dolt/
 *.db
 .beads-credential-key
+
+# Beads issue tracker local state
+.beads/
