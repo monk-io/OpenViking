@@ -34,11 +34,10 @@ class RolloutArtifactIndex:
 
 
 class RolloutArtifactRecorder:
-    """Write per-case/per-rollout artifacts for selected case groups.
+    """Write per-case/per-rollout artifacts for all case groups.
 
-    A case group is persisted only when at least one rollout in that original
-    case group failed.  Once selected, all rollouts in the group are written so
-    success/failure trials can be compared by an LLM.
+    Each case group and all its rollouts are written to disk so success/failure
+    trials can be compared by an LLM or inspected manually.
     """
 
     def __init__(
@@ -77,8 +76,7 @@ class RolloutArtifactRecorder:
             ]
         )
         for group_id, records in grouped.items():
-            if any(not record.passed for record in records):
-                self._write_group(group_id, records)
+            self._write_group(group_id, records)
 
     async def record_train_epoch(
         self,
@@ -110,12 +108,8 @@ class RolloutArtifactRecorder:
             )
         grouped = self._group_records(records)
         for group_id, group_records in grouped.items():
-            if any(
-                not record.passed or _commit_failed(record.commit_result)
-                for record in group_records
-            ):
-                self._write_group(group_id, group_records)
-                await self._write_train_commit_artifacts(group_records)
+            self._write_group(group_id, group_records)
+            await self._write_train_commit_artifacts(group_records)
 
     def finalize(self) -> RolloutArtifactIndex:
         case_groups = sorted(self._case_groups.values(), key=lambda item: item["case_group_id"])
