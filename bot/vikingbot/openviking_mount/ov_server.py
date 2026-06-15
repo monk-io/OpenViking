@@ -531,11 +531,12 @@ class VikingClient:
             client, should_close = await self._get_user_scoped_client(user_id)
 
         try:
+            if peer_id:
+                target_uri = target_uri or self._current_peer_memory_target_uri(peer_id)
             result = await client.search(
                 query,
                 target_uri=target_uri,
                 limit=limit,
-                peer_id=self._peer_id(peer_id),
             )
         finally:
             if should_close:
