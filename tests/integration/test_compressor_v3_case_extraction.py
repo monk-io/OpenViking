@@ -8,7 +8,6 @@ the session, and verifies that V3 extracts a trainable ``cases`` memory.
 
 Prerequisites for a full pass:
 - OpenViking server is running locally (default: http://localhost:1933)
-- Server config uses memory.version = "v3"
 - Server has a usable VLM/embedding configuration for memory extraction
 """
 

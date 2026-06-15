@@ -67,9 +67,17 @@ def _case_operation() -> ResolvedOperation:
     )
 
 
-def test_factory_supports_v3():
-    compressor = create_session_compressor(vikingdb=None, memory_version="v3")
+def test_factory_defaults_to_v3():
+    compressor = create_session_compressor(vikingdb=None)
     assert isinstance(compressor, SessionCompressorV3)
+
+
+def test_factory_ignores_deprecated_memory_version():
+    assert isinstance(create_session_compressor(vikingdb=None, memory_version="v2"), SessionCompressorV3)
+    assert isinstance(
+        create_session_compressor(vikingdb=None, memory_version="unsupported"),
+        SessionCompressorV3,
+    )
 
 
 @pytest.mark.asyncio

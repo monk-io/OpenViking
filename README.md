@@ -341,6 +341,8 @@ If you prefer manual configuration, create `~/.openviking/ov.conf`, remove the c
 
 > **Note**: For embedding models, supported providers are `volcengine` (Doubao), `openai`, `azure`, `jina`, `ollama`, `voyage`, `dashscope`, `minimax`, `cohere`, `vikingdb`, `gemini` (requires `pip install "google-genai>=1.0.0"`), `litellm`, and `local`. For VLM models, common providers include `volcengine`, `openai`, `openai-codex`, `kimi`, and `glm`.
 
+> **Memory config**: OpenViking always uses the v3 memory extraction pipeline. The legacy `memory.version` setting is deprecated and ignored; existing configs that set it still load without changing behavior.
+
 ##### Server Configuration Examples
 
 👇 Expand to see the configuration example for your model service:

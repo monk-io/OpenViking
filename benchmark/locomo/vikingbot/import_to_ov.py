@@ -870,7 +870,7 @@ async def run_import(args: argparse.Namespace) -> None:
                     total_llm_output_tokens += result.get("llm_output_tokens", 0)
                 elif result.get("status") == "error":
                     error_count += 1
-                    record_failed_trace_id(result, failed_trace_ids)
+                    record_failed_session(result, failed_sessions)
                 elif result.get("status") == "skipped":
                     skipped_count += 1
 
@@ -963,7 +963,7 @@ async def run_import(args: argparse.Namespace) -> None:
                         total_llm_output_tokens += res.get("llm_output_tokens", 0)
                     elif res.get("status") == "error":
                         error_count += 1
-                        record_failed_trace_id(res, failed_trace_ids)
+                        record_failed_session(res, failed_sessions)
                     elif res.get("status") == "skipped":
                         skipped_count += 1
 
@@ -1073,7 +1073,7 @@ async def run_import(args: argparse.Namespace) -> None:
                     total_llm_output_tokens += r.get("llm_output_tokens", 0)
                 elif r.get("status") == "error":
                     error_count += 1
-                    record_failed_trace_id(r, failed_trace_ids)
+                    record_failed_session(r, failed_sessions)
 
     # Final summary
     total_processed = success_count + error_count + skipped_count

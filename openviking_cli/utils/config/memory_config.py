@@ -13,8 +13,8 @@ class MemoryConfig(BaseModel):
     """Memory configuration for OpenViking."""
 
     version: str = Field(
-        default="v2",
-        description="Memory implementation version. 'v2' is stable; 'v3' adds commit-case streaming train.",
+        default="v3",
+        description="Deprecated and ignored. Memory extraction always uses v3.",
     )
     custom_templates_dir: str = Field(
         default="",
@@ -100,12 +100,14 @@ class MemoryConfig(BaseModel):
             )
         return data
 
-    @field_validator("version")
+    @field_validator("version", mode="before")
     @classmethod
-    def validate_version(cls, value: str) -> str:
-        if value not in {"v2", "v3"}:
-            raise ValueError("memory.version only supports 'v2' or 'v3'")
-        return value
+    def accept_deprecated_version(cls, value: Any) -> str:
+        if value not in (None, ""):
+            logger.warning(
+                "memory.version is deprecated and ignored; memory extraction always uses v3"
+            )
+        return "v3"
 
     @classmethod
     def from_dict(cls, config: Dict[str, Any]) -> "MemoryConfig":

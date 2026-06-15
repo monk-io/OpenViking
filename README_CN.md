@@ -297,6 +297,8 @@ openviking-server doctor
 
 > **注意**：对于 embedding 模型，支持 `volcengine`（豆包）、`openai`、`azure`、`jina`、`ollama`、`voyage`、`dashscope`、`minimax`、`cohere`、`vikingdb`、`gemini`（需 `pip install "google-genai>=1.0.0"`）、`litellm` 和 `local`。对于 VLM 模型，常见提供商包括 `volcengine`、`openai`、`openai-codex`、`kimi`、`glm`。
 
+> **Memory 配置**：OpenViking 始终使用 v3 记忆抽取链路。旧的 `memory.version` 配置项已废弃且会被忽略；已有配置中保留该字段仍可正常加载，但不会改变行为。
+
 ##### 服务器配置示例
 
 👇 展开查看您的模型服务的配置示例：

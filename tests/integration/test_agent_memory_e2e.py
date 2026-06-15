@@ -15,8 +15,7 @@ What this test covers
 
 Prerequisites
 -------------
-- ~/.openviking/ov.conf has:
-    "memory": { "version": "v2" }
+- ~/.openviking/ov.conf has usable VLM/embedding configuration for memory extraction.
 
 Run
 ---
