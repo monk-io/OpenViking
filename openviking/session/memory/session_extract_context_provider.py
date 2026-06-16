@@ -343,6 +343,13 @@ After exploring, analyze the conversation and output ALL memory write/edit/delet
         )
         return tool_ctx
 
+    @staticmethod
+    def _is_expected_read_not_found(error: Any) -> bool:
+        if not error:
+            return False
+        error_text = str(error)
+        return error_text == "not_found" or error_text.startswith("File not found")
+
     async def read_file(self, uri: str) -> Optional[Dict]:
         """Read a file via MemoryReadTool (auto-registers page_id, fills read_file_contents)."""
         read_tool = get_tool("read")
@@ -351,11 +358,13 @@ After exploring, analyze the conversation and output ALL memory write/edit/delet
         try:
             result = await read_tool.execute(self.create_tool_context(), uri=uri)
             if isinstance(result, dict) and "error" in result:
-                tracer.info(f"Failed to read {uri}: {result['error']}")
+                if not self._is_expected_read_not_found(result["error"]):
+                    tracer.info(f"Failed to read {uri}: {result['error']}")
                 return None
             return result
         except Exception as e:
-            tracer.error(f"Failed to read {uri}: {e}")
+            if not self._is_expected_read_not_found(e):
+                tracer.error(f"Failed to read {uri}: {e}")
             return None
 
     async def search_files(
@@ -525,14 +534,13 @@ After exploring, analyze the conversation and output ALL memory write/edit/delet
         if not tool:
             return {"error": f"Unknown tool: {tool_call.name}"}
         result = await tool.execute(self.create_tool_context(), **tool_call.arguments)
-        if (
+        is_expected_read_not_found = (
             tool_call.name == "read"
             and isinstance(result, dict)
             and result.get("error")
-            and str(result["error"]).startswith("File not found")
-        ):
-            tracer.info(f"tool_call.arguments={tool_call.arguments} read not found")
-        else:
+            and self._is_expected_read_not_found(result["error"])
+        )
+        if not is_expected_read_not_found:
             tracer.info(f"tool_call.arguments={tool_call.arguments}")
         return result
 
