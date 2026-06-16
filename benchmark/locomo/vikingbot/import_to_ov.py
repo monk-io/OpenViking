@@ -76,14 +76,13 @@ async def _retry_transient_http(
             last_exc = exc
             if attempt >= attempts:
                 break
-            delay = _retry_delay(attempt)
-            print(
-                f"    -> [RETRY] {label} attempt {attempt}/{attempts} "
-                f"failed with {_transport_error_message(exc)}; retrying in {delay:.1f}s",
-                file=sys.stderr,
-            )
-            await asyncio.sleep(delay)
+            await asyncio.sleep(_retry_delay(attempt))
     assert last_exc is not None
+    print(
+        f"    -> [RETRY] {label} failed after {attempts} attempts "
+        f"with {_transport_error_message(last_exc)}",
+        file=sys.stderr,
+    )
     raise last_exc
 
 
