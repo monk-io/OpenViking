@@ -318,20 +318,9 @@ def run_vikingbot_chat(
         time_cost = end_time - start_time
 
         output = result.stdout.strip()
-        # 解析返回的json结果，处理换行、多余前缀等特殊情况
-        # 输出可能包含日志行（如 WARNING），只取第一行合法 JSON
-        resp_json = None
-        for line in output.splitlines():
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                resp_json = json.loads(line, strict=False)
-                if isinstance(resp_json, dict) and ("text" in resp_json or "response" in resp_json):
-                    break
-            except (json.JSONDecodeError, ValueError):
-                continue
-        if resp_json is not None:
+        # 解析返回的 JSON 结果
+        try:
+            resp_json = json.loads(output, strict=False)
             response = resp_json.get("text", "")
             token_usage = resp_json.get(
                 "token_usage", {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
@@ -339,7 +328,7 @@ def run_vikingbot_chat(
             time_cost = resp_json.get("time_cost", time_cost)
             iteration = resp_json.get("iteration", 0)
             tools_used_names = resp_json.get("tools_used_names", [])
-        else:
+        except (json.JSONDecodeError, ValueError):
             response = f"[PARSE ERROR] {output}"
             token_usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
             iteration = 0
