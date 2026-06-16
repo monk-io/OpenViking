@@ -114,7 +114,7 @@ directory: "viking://user/{{ user_space }}/memories/..."
 enabled: true
 operation_mode: "upsert"
 stage: "user"
-enable_peer: true
+peer_enabled: true
 ```
 
 字段含义：
@@ -139,7 +139,7 @@ enable_peer: true
   - 该类记忆的更新模式，例如 `upsert`
 - `stage`
   - 抽取阶段。默认是 `user`，参与会话用户记忆抽取；`agent` 用于 trajectories、experiences 这类执行派生 schema。
-- `enable_peer`
+- `peer_enabled`
   - 当 `peer_id` 或消息 ranges 指向某个 peer 时，是否将该类记忆按 peer 分目录存储。默认是 `true`；如果该类记忆必须保留在当前 user 目录下，设置为 `false`。
 
 编写 memory schema 时，建议重点关注：

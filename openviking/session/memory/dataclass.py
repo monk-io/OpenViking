@@ -204,7 +204,7 @@ class MemoryTypeSchema(BaseModel):
         "user",
         description="Extraction stage: 'user' for long-term user memory, 'agent' for execution-derived memory.",
     )
-    enable_peer: bool = Field(
+    peer_enabled: bool = Field(
         True,
         description="Whether this memory type is stored separately under peer directories.",
     )

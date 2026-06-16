@@ -116,7 +116,7 @@ class MemoryIsolationHandler:
             item_dict["user_id"] = self.ctx.user.user_id
         item_dict.pop("user_ids", None)
 
-        if memory_type_schema is not None and not memory_type_schema.enable_peer:
+        if memory_type_schema is not None and not memory_type_schema.peer_enabled:
             item_dict.pop("peer_id", None)
             return
 
@@ -135,7 +135,7 @@ class MemoryIsolationHandler:
         return True
 
     def _schema_peer_enabled(self, memory_type_schema: MemoryTypeSchema) -> bool:
-        return bool(getattr(memory_type_schema, "enable_peer", True))
+        return bool(getattr(memory_type_schema, "peer_enabled", True))
 
     def _can_write_peer(self, peer_id: str) -> bool:
         return self.allow_peer and peer_id in self.allowed_peer_ids

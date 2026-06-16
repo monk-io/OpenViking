@@ -89,7 +89,7 @@ def _registry() -> MemoryTypeRegistry:
             directory="viking://user/{{ user_space }}/memories/cases",
             filename_template="{{ case_name }}.md",
             operation_mode="add_only",
-            enable_peer=False,
+            peer_enabled=False,
             fields=[
                 MemoryField(
                     name="case_name",
@@ -550,7 +550,7 @@ def test_enforce_merge_group_self_scope_removes_peer_id():
     assert op.uris == ["viking://user/u/memories/notes/self_note.md"]
 
 
-def test_enforce_merge_group_enable_peer_false_keeps_self_scope():
+def test_enforce_merge_group_peer_enabled_false_keeps_self_scope():
     op = ResolvedOperation(
         old_memory_file_content=None,
         memory_fields={

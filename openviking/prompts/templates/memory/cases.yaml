@@ -12,7 +12,7 @@ description: |
 directory: "viking://user/{{ user_space }}/memories/cases"
 filename_template: "{{ case_name }}.md"
 enabled: true
-enable_peer: false
+peer_enabled: false
 content_template: |
   # {{ case_name }}
 
