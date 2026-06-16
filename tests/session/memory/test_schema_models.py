@@ -84,7 +84,7 @@ class TestSchemaModelGenerator:
         return create_default_registry()
 
 
-    def test_peer_scoped_false_omits_peer_id_field(self):
+    def test_enable_peer_false_omits_peer_id_field(self):
         memory_type = MemoryTypeSchema(
             memory_type="cases",
             description="Case memory",
@@ -98,7 +98,7 @@ class TestSchemaModelGenerator:
             ],
             filename_template="{{ case_name }}.md",
             directory="viking://user/{{ user_space }}/memories/cases",
-            peer_scoped=False,
+            enable_peer=False,
         )
         role_scope = type("RoleScope", (), {"peer_ids": ["web-visitor-alice"]})()
 
