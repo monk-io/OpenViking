@@ -147,9 +147,12 @@ class RemoteRolloutExecutor:
                 async with semaphore:
                     progress.start_one()
                     try:
-                        return await self._execute_one(client, case, policy_set, context)
-                    finally:
+                        rollout = await self._execute_one(client, case, policy_set, context)
                         progress.complete_one()
+                        return rollout
+                    except Exception:
+                        progress.fail_one()
+                        raise
 
             try:
                 return list(await asyncio.gather(*(execute_one(case) for case in case_list)))

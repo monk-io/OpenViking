@@ -9,6 +9,13 @@ import time
 from dataclasses import dataclass, field
 from typing import Any
 
+from benchmark.tau2.train.rollout_executor_vikingbot import (
+    _as_tool_input,
+    _message,
+    _safe_float,
+    _stringify,
+    _to_jsonable,
+)
 from openviking.message import Message, TextPart, ToolPart
 from openviking.session.train import (
     Case,
@@ -18,17 +25,31 @@ from openviking.session.train import (
     Rollout,
     RubricEvaluation,
 )
+from openviking.session.train.components.progress import ProgressPrinter
 from openviking_cli.utils import get_logger
 
-from benchmark.tau2.train.rollout_executor_vikingbot import (
-    _as_tool_input,
-    _message,
-    _safe_float,
-    _stringify,
-    _to_jsonable,
-)
-
 logger = get_logger(__name__)
+
+
+def _progress_stage_label(stage: Any, *, default: str) -> str:
+    stage_text = str(stage or "")
+    stage_name = stage_text.split(maxsplit=1)[0]
+    if stage_name in {
+        "train_rollout",
+        "test_rollout",
+        "baseline_test_rollout",
+        "final_test_rollout",
+    }:
+        return f"{stage_name}_start"
+    if stage_name in {
+        "train_rollout_start",
+        "test_rollout_start",
+        "baseline_test_rollout_start",
+        "final_test_rollout_start",
+    }:
+        return stage_name
+    return default
+
 
 AGENT_NAME_PREFIX = "openviking_native_memory_agent"
 _NATIVE_AGENT_CONFIGS: dict[str, "NativeTau2RolloutExecutor"] = {}
@@ -82,6 +103,8 @@ class NativeTau2RolloutExecutor:
     scope_prompt: str = ""
     rollout_language: str = "default"
     log_timings: bool = True
+    show_progress: bool = False
+    progress_label: str = "tau2"
 
     def __post_init__(self) -> None:
         if self.concurrency <= 0:
@@ -105,7 +128,9 @@ class NativeTau2RolloutExecutor:
             if value is not None and value < 0:
                 raise ValueError(f"{name} must be non-negative")
         self.first_user_retrieval_top_k = self.first_user_retrieval_top_k or self.retrieval_top_k
-        self.first_user_inject_top_k = self.first_user_inject_top_k or self.first_user_retrieval_top_k
+        self.first_user_inject_top_k = (
+            self.first_user_inject_top_k or self.first_user_retrieval_top_k
+        )
         self.prewrite_retrieval_top_k = self.prewrite_retrieval_top_k or self.retrieval_top_k
         self.prewrite_inject_top_k = self.prewrite_inject_top_k or self.prewrite_retrieval_top_k
         if self.first_user_memory_inject_max_chars is None:
@@ -120,14 +145,32 @@ class NativeTau2RolloutExecutor:
         context: ExecutionContext,
     ) -> list[Rollout]:
         self._sync_openviking_options(policy_set)
+        progress = ProgressPrinter(
+            total=len(cases),
+            label=_progress_stage_label(context.metadata.get("stage"), default=self.progress_label),
+            enabled=self.show_progress,
+            description=f"Running {len(cases)} tau2 native rollouts, concurrency={self.concurrency}",
+        )
+        progress.render()
         semaphore = asyncio.Semaphore(self.concurrency)
 
         async def run_one(index: int, case: Case) -> Rollout:
             async with semaphore:
-                return await asyncio.to_thread(self._execute_one_sync, case, context, index)
+                progress.start_one()
+                try:
+                    rollout = await asyncio.to_thread(self._execute_one_sync, case, context, index)
+                    progress.complete_one()
+                    return rollout
+                except Exception:
+                    progress.fail_one()
+                    raise
 
-        return list(await asyncio.gather(*(run_one(index, case) for index, case in enumerate(cases))))
-
+        try:
+            return list(
+                await asyncio.gather(*(run_one(index, case) for index, case in enumerate(cases)))
+            )
+        finally:
+            progress.finish()
 
     def _sync_openviking_options(self, policy_set: ExperienceSet) -> None:
         metadata = dict(policy_set.metadata or {})
@@ -259,8 +302,8 @@ def _resolve_llm_runtime_config(
     override the model names.
     """
 
-    from copy import deepcopy
     import os
+    from copy import deepcopy
 
     from tau2.config import (
         DEFAULT_LLM_AGENT,
@@ -298,8 +341,6 @@ def _first_non_empty(*values: Any, name: str) -> str:
     raise ValueError(f"{name} must be set for tau2 native rollout")
 
 
-
-
 def _ensure_tau2_llm_api_bases() -> None:
     import os
 
@@ -315,6 +356,7 @@ def _ensure_tau2_llm_api_bases() -> None:
     os.environ.setdefault("AGENT_API_BASE", base_url)
     os.environ.setdefault("USER_API_BASE", base_url)
 
+
 def _optional_metadata_str(metadata: dict[str, Any], *keys: str) -> str | None:
     for key in keys:
         value = metadata.get(key)
@@ -324,6 +366,7 @@ def _optional_metadata_str(metadata: dict[str, Any], *keys: str) -> str | None:
         if text:
             return text
     return None
+
 
 def _register_native_memory_agent(executor: NativeTau2RolloutExecutor) -> str:
     from tau2.agent.llm_agent import LLMAgent, LLMAgentState
@@ -505,8 +548,13 @@ def _register_native_memory_agent(executor: NativeTau2RolloutExecutor) -> str:
                 query = str(getattr(message, "content", "") or "")
                 block, matches = self._retrieve(
                     query,
-                    search_limit=int(executor_config.first_user_retrieval_top_k or executor_config.retrieval_top_k),
-                    inject_limit=int(executor_config.first_user_inject_top_k or executor_config.retrieval_top_k),
+                    search_limit=int(
+                        executor_config.first_user_retrieval_top_k
+                        or executor_config.retrieval_top_k
+                    ),
+                    inject_limit=int(
+                        executor_config.first_user_inject_top_k or executor_config.retrieval_top_k
+                    ),
                     inject_max_chars=executor_config.first_user_memory_inject_max_chars,
                 )
                 prompt = (
@@ -527,8 +575,13 @@ def _register_native_memory_agent(executor: NativeTau2RolloutExecutor) -> str:
                     query = _tool_call_query(write_calls, state.messages)
                     block, _matches = self._retrieve(
                         query,
-                        search_limit=int(executor_config.prewrite_retrieval_top_k or executor_config.retrieval_top_k),
-                        inject_limit=int(executor_config.prewrite_inject_top_k or executor_config.retrieval_top_k),
+                        search_limit=int(
+                            executor_config.prewrite_retrieval_top_k
+                            or executor_config.retrieval_top_k
+                        ),
+                        inject_limit=int(
+                            executor_config.prewrite_inject_top_k or executor_config.retrieval_top_k
+                        ),
                         inject_max_chars=executor_config.prewrite_memory_inject_max_chars,
                     )
                     if block:
@@ -702,7 +755,9 @@ def _simulation_message_to_rollout_messages(message: Any, index: int) -> list[Me
                         role="assistant" if role == "assistant" else "user",
                         parts=[
                             ToolPart(
-                                tool_id=str(getattr(call, "id", "") or f"tau2-tool-{index}-{call_idx}"),
+                                tool_id=str(
+                                    getattr(call, "id", "") or f"tau2-tool-{index}-{call_idx}"
+                                ),
                                 tool_name=_tool_call_name(call),
                                 tool_input=_as_tool_input(_tool_call_arguments(call)),
                                 tool_status="running",
@@ -730,7 +785,9 @@ def _simulation_message_to_rollout_messages(message: Any, index: int) -> list[Me
                         tool_id=str(getattr(message, "id", "") or f"tau2-tool-{index}"),
                         tool_name="unknown",
                         tool_output=str(getattr(message, "content", "") or ""),
-                        tool_status="error" if bool(getattr(message, "error", False)) else "completed",
+                        tool_status="error"
+                        if bool(getattr(message, "error", False))
+                        else "completed",
                     )
                 ],
                 created_at=getattr(message, "timestamp", None),
@@ -793,7 +850,9 @@ def _tau2_evaluation(*, reward: Any, evaluation_result: Any) -> RubricEvaluation
                 passed=passed,
                 score=score,
                 feedback=feedback,
-                evidence=[_stringify(evaluation_jsonable)] if evaluation_jsonable is not None else [],
+                evidence=[_stringify(evaluation_jsonable)]
+                if evaluation_jsonable is not None
+                else [],
                 metadata={"reward": score},
             )
         ],

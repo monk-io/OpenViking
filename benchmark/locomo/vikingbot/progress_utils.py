@@ -1,6 +1,6 @@
 """Shared progress bar utilities for LoCoMo benchmark scripts.
 
-Provides a three-state progress bar (done / running / pending) built on
+Provides a four-state progress bar (successful / failed / running / pending) built on
 top of ``rich.progress``, plus helpers for both threaded and asyncio
 scenarios.
 """
@@ -47,21 +47,22 @@ class ElapsedTimeColumn(ProgressColumn):
 
 
 # ---------------------------------------------------------------------------
-# Three-state bar column
+# Multi-state bar column
 # ---------------------------------------------------------------------------
 
 
 class ThreeStateBarColumn(ProgressColumn):
-    """A progress bar that renders three states: done / running / pending.
+    """A progress bar that renders four states: successful / failed / running / pending.
 
-    - **done**     = solid filled (``bar.complete`` style)
-    - **running**  = shaded / mid-colour (``bar.finished`` style, repurposed)
-    - **pending**  = hollow / background (``bar.pulse`` or ``bar.back`` style)
+    - **successful** = solid green
+    - **failed**     = solid red
+    - **running**    = shaded yellow
+    - **pending**    = hollow / background
 
     The number of in-flight items is read from
     ``task.fields.get("running", 0)``.  The total bar width maps to
-    ``task.total``; the solid portion is ``task.completed``; the shaded
-    portion extends from there by ``running``; the rest is pending.
+    ``task.total``; ``task.completed`` is the processed count and
+    ``task.fields["failed"]`` splits failures out of that processed count.
     """
 
     def __init__(
@@ -84,11 +85,13 @@ class ThreeStateBarColumn(ProgressColumn):
         self.pulse_style = pulse_style
 
     def render(self, task: Task) -> Text:
-        """Render the three-state bar."""
+        """Render the four-state bar."""
         bar_width = self.bar_width or 40
 
         total = max(task.total or 0, 0)
-        done = max(task.completed or 0, 0)
+        processed = max(task.completed or 0, 0)
+        failed = max(int(task.fields.get("failed", 0) or 0), 0)
+        done = max(int(task.fields.get("succeeded", processed - failed) or 0), 0)
         running = max(int(task.fields.get("running", 0) or 0), 0)
 
         if total <= 0:
@@ -96,18 +99,22 @@ class ThreeStateBarColumn(ProgressColumn):
             return Text("─" * bar_width, style="bar.back")
 
         # Clamp so we don't exceed 100% visually
-        if done > total:
-            done = total
-        if done + running > total:
-            running = total - done
+        done = min(done, total)
+        failed = min(failed, total - done)
+        running = min(running, total - done - failed)
 
         done_width = int(bar_width * done / total)
-        running_width = int(bar_width * (done + running) / total) - done_width
-        pending_width = bar_width - done_width - running_width
+        failed_width = int(bar_width * (done + failed) / total) - done_width
+        running_width = (
+            int(bar_width * (done + failed + running) / total) - done_width - failed_width
+        )
+        pending_width = bar_width - done_width - failed_width - running_width
 
         bar = Text()
         if done_width > 0:
             bar.append("█" * done_width, style="green")
+        if failed_width > 0:
+            bar.append("█" * failed_width, style="red")
         if running_width > 0:
             bar.append("▓" * running_width, style="yellow")
         if pending_width > 0:
@@ -126,13 +133,12 @@ def make_three_state_progress(
     console: Optional[Console] = None,
     transient: bool = False,
 ) -> tuple[Progress, TaskID]:
-    """Create a :class:`Progress` instance with a three-state bar.
+    """Create a :class:`Progress` instance with a four-state bar.
 
     Returns the ``(progress, task_id)`` pair.  The task starts with
-    ``completed=0``, ``total=0``, ``running=0``; callers should call
-    ``progress.update(task_id, total=N)`` to set the total and
-    ``progress.update(task_id, advance=1)`` / modify ``running`` via
-    ``fields`` as work proceeds.
+    ``completed=0``, ``total=0``, ``running=0``, ``failed=0``; callers
+    should call ``progress.update(task_id, total=N)`` to set the total and
+    use a tracker to keep success/failure/running fields in sync.
     """
     console = console or Console(stderr=True, soft_wrap=False)
     progress = Progress(
@@ -140,13 +146,22 @@ def make_three_state_progress(
         TextColumn(
             "[progress.percentage]{task.percentage:>3.0f}%"
             " ({task.completed}/{task.total}, "
+            "[bold green]{task.fields[succeeded]} ok[/], "
+            "[bold red]{task.fields[failed]} failed[/], "
             "[bold yellow]{task.fields[running]} running[/])"
         ),
         ElapsedTimeColumn(),
         console=console,
         transient=transient,
     )
-    task_id = progress.add_task(description, total=0, running=0, started_at=time.monotonic())
+    task_id = progress.add_task(
+        description,
+        total=0,
+        running=0,
+        succeeded=0,
+        failed=0,
+        started_at=time.monotonic(),
+    )
     return progress, task_id
 
 
@@ -189,8 +204,9 @@ class ThreadSafeProgressTracker:
         self._lock = threading.Lock()
         self._running = 0
         self._done = 0
+        self._failed = 0
         self._total = total
-        self._progress.update(task_id, total=total, completed=0, running=0)
+        self._progress.update(task_id, total=total, completed=0, running=0, succeeded=0, failed=0)
 
     def job_started(self) -> None:
         """Call when a worker thread picks up a job."""
@@ -201,15 +217,19 @@ class ThreadSafeProgressTracker:
                 running=self._running,
             )
 
-    def job_finished(self) -> None:
-        """Call when a worker thread finishes a job (success or error)."""
+    def job_finished(self, *, failed: bool = False) -> None:
+        """Call when a worker thread finishes a job."""
         with self._lock:
             self._running = max(0, self._running - 1)
             self._done += 1
+            if failed:
+                self._failed += 1
             self._progress.update(
                 self._task_id,
                 completed=self._done,
                 running=self._running,
+                succeeded=self._done - self._failed,
+                failed=self._failed,
             )
 
     @property
@@ -221,6 +241,11 @@ class ThreadSafeProgressTracker:
     def running(self) -> int:
         with self._lock:
             return self._running
+
+    @property
+    def failed(self) -> int:
+        with self._lock:
+            return self._failed
 
 
 # ---------------------------------------------------------------------------
@@ -241,20 +266,25 @@ class AsyncProgressTracker:
         self._task_id = task_id
         self._running = 0
         self._done = 0
+        self._failed = 0
         self._total = total
-        self._progress.update(task_id, total=total, completed=0, running=0)
+        self._progress.update(task_id, total=total, completed=0, running=0, succeeded=0, failed=0)
 
     def job_started(self) -> None:
         self._running += 1
         self._progress.update(self._task_id, running=self._running)
 
-    def job_finished(self) -> None:
+    def job_finished(self, *, failed: bool = False) -> None:
         self._running = max(0, self._running - 1)
         self._done += 1
+        if failed:
+            self._failed += 1
         self._progress.update(
             self._task_id,
             completed=self._done,
             running=self._running,
+            succeeded=self._done - self._failed,
+            failed=self._failed,
         )
 
     @property
@@ -264,3 +294,7 @@ class AsyncProgressTracker:
     @property
     def running(self) -> int:
         return self._running
+
+    @property
+    def failed(self) -> int:
+        return self._failed

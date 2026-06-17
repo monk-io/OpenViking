@@ -23,15 +23,14 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple, TypeVar
 
-import openviking as ov
 import httpx
-
 from progress_utils import (
     AsyncProgressTracker,
     make_three_state_progress,
     should_show_progress,
 )
 
+import openviking as ov
 
 TRACE_ID_RE = re.compile(r"\btrace_?id[=:\s]+([^,\s:)\]]+)")
 
@@ -165,7 +164,6 @@ async def _recover_commit_after_transport_error(
             pass
         await asyncio.sleep(_retry_delay(attempt, base=0.5, cap=5.0))
     return None
-
 
 
 def _get_session_number(session_key: str) -> int:
@@ -873,7 +871,9 @@ async def run_import(args: argparse.Namespace) -> None:
     progress = None
     show_progress = should_show_progress(args.no_progress)
     args._show_progress = show_progress
-    session_semaphore = asyncio.Semaphore(args.parallel_sessions) if args.parallel_sessions else None
+    session_semaphore = (
+        asyncio.Semaphore(args.parallel_sessions) if args.parallel_sessions else None
+    )
     if args.parallel_sessions:
         print(
             f"[parallel-sessions] global concurrency={args.parallel_sessions}",
@@ -883,11 +883,17 @@ async def run_import(args: argparse.Namespace) -> None:
     async def process_single_session_with_progress(**kwargs) -> Dict[str, Any]:
         if progress_tracker is not None:
             progress_tracker.job_started()
+        failed = False
         try:
-            return await process_single_session(**kwargs)
+            result = await process_single_session(**kwargs)
+            failed = result.get("status") == "error"
+            return result
+        except Exception:
+            failed = True
+            raise
         finally:
             if progress_tracker is not None:
-                progress_tracker.job_finished()
+                progress_tracker.job_finished(failed=failed)
 
     if args.input.endswith(".json"):
         # LoCoMo JSON format
@@ -963,9 +969,7 @@ async def run_import(args: argparse.Namespace) -> None:
             for round_i in range(max_sessions):
                 for sample_id, display_id, sessions in sample_info_list:
                     if round_i < len(sessions):
-                        all_sessions_rr.append(
-                            (sample_id, display_id, sessions[round_i])
-                        )
+                        all_sessions_rr.append((sample_id, display_id, sessions[round_i]))
 
             print(
                 f"[parallel-sessions] global concurrency={args.parallel_sessions} "
@@ -1013,6 +1017,7 @@ async def run_import(args: argparse.Namespace) -> None:
                 if progress_tracker is not None:
                     progress_tracker.job_started()
 
+                failed = False
                 try:
                     result = await process_single_session(
                         messages=messages,
@@ -1024,9 +1029,13 @@ async def run_import(args: argparse.Namespace) -> None:
                         ingest_record=ingest_record,
                         args=args,
                     )
+                    failed = result.get("status") == "error"
+                except Exception:
+                    failed = True
+                    raise
                 finally:
                     if progress_tracker is not None:
-                        progress_tracker.job_finished()
+                        progress_tracker.job_finished(failed=failed)
 
                 if result.get("status") == "success":
                     success_count += 1
@@ -1097,8 +1106,9 @@ async def run_import(args: argparse.Namespace) -> None:
                     if progress_tracker is not None:
                         progress_tracker.job_started()
 
+                    failed = False
                     try:
-                        return await process_single_session(
+                        result = await process_single_session(
                             messages=messages,
                             sample_id=sample_id,
                             display_id=display_id,
@@ -1108,9 +1118,14 @@ async def run_import(args: argparse.Namespace) -> None:
                             ingest_record=ingest_record,
                             args=args,
                         )
+                        failed = result.get("status") == "error"
+                        return result
+                    except Exception:
+                        failed = True
+                        raise
                     finally:
                         if progress_tracker is not None:
-                            progress_tracker.job_finished()
+                            progress_tracker.job_finished(failed=failed)
 
                 session_results = []
                 for sess in sessions:
@@ -1143,9 +1158,7 @@ async def run_import(args: argparse.Namespace) -> None:
                         await process_sample(sample_id, display_id, sessions)
 
                 tasks = [
-                    asyncio.create_task(
-                        process_sample_with_limit(sid, did, sessions)
-                    )
+                    asyncio.create_task(process_sample_with_limit(sid, did, sessions))
                     for sid, did, sessions in sample_info_list
                 ]
             else:
@@ -1180,7 +1193,8 @@ async def run_import(args: argparse.Namespace) -> None:
             ):
                 if not show_progress:
                     print(
-                        "  [SKIP] already imported (use --force-ingest to reprocess)", file=sys.stderr
+                        "  [SKIP] already imported (use --force-ingest to reprocess)",
+                        file=sys.stderr,
                     )
                 skipped_count += 1
                 continue
@@ -1253,7 +1267,10 @@ async def run_import(args: argparse.Namespace) -> None:
     if success_trace_ids:
         preview = success_trace_ids[:10]
         suffix = " ..." if len(success_trace_ids) > 10 else ""
-        print(f"Success trace IDs ({len(success_trace_ids)}): {' '.join(preview)}{suffix}", file=sys.stderr)
+        print(
+            f"Success trace IDs ({len(success_trace_ids)}): {' '.join(preview)}{suffix}",
+            file=sys.stderr,
+        )
     if failed_sessions:
         print(f"\nFailed sessions ({len(failed_sessions)}):", file=sys.stderr)
         for idx, s in enumerate(failed_sessions, 1):

@@ -9,7 +9,6 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 from openai import AsyncOpenAI
-
 from progress_utils import (
     AsyncProgressTracker,
     make_three_state_progress,
@@ -191,6 +190,7 @@ async def main():
             if progress_tracker is not None:
                 progress_tracker.job_started()
 
+            failed = False
             try:
                 row = rows[idx]
                 question = row["question"]
@@ -212,9 +212,12 @@ async def main():
                     print(f"Saved result for {idx + 1}/{total}: {row['result']}")
 
                 return idx, row
+            except Exception:
+                failed = True
+                raise
             finally:
                 if progress_tracker is not None:
-                    progress_tracker.job_finished()
+                    progress_tracker.job_finished(failed=failed)
 
     tasks = [process_row(idx) for idx in ungraded]
 

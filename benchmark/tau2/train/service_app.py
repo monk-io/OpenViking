@@ -7,9 +7,9 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-from concurrent.futures import ThreadPoolExecutor
 import os
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
@@ -60,13 +60,15 @@ def create_app(
 
     def make_rollout_executor(options: dict[str, Any]):
         backend = normalize_tau2_rollout_backend(
-            options.get("rollout_backend")
-            or options.get("backend")
-            or default_backend
+            options.get("rollout_backend") or options.get("backend") or default_backend
         )
         return make_tau2_rollout_executor(
             backend=backend,
-            options=options,
+            options={
+                **options,
+                "show_progress": options.get("show_progress", True),
+                "progress_label": options.get("progress_label") or "tau2",
+            },
             config_path=config_path,
             concurrency=1,
             rollout_language=rollout_language,

@@ -85,9 +85,12 @@ class SessionCommitPolicyTrainer:
             async with semaphore:
                 progress.start_one()
                 try:
-                    return await self._commit_one(rollout, idx)
-                finally:
+                    result = await self._commit_one(rollout, idx)
                     progress.complete_one()
+                    return result
+                except Exception:
+                    progress.fail_one()
+                    raise
 
         try:
             commit_results = await asyncio.gather(

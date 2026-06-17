@@ -187,8 +187,9 @@ def test_tau2_rollout_messages_use_structured_tool_parts():
 def test_tau2_reward_info_is_json_safe_in_rollout_messages_and_evaluation():
     import json
 
-    from benchmark.tau2.train.rollout_executor import _build_rollout_messages, _tau2_evaluation
     from tau2.data_model.simulation import RewardInfo, RewardType
+
+    from benchmark.tau2.train.rollout_executor import _build_rollout_messages, _tau2_evaluation
 
     reward_info = RewardInfo(
         reward=1.0,
@@ -321,6 +322,7 @@ def test_tau2_rollout_backend_factory_defaults_to_native():
     assert executor.concurrency == 3
     assert executor.memory_enabled is False
     assert executor.max_steps == 7
+    assert executor.show_progress is False
 
 
 def test_tau2_native_rollout_resolves_non_empty_llms(monkeypatch):
@@ -376,7 +378,10 @@ def test_tau2_rollout_backend_factory_selects_vikingbot(monkeypatch):
 
     executor = module.make_tau2_rollout_executor(
         backend="vikingbot",
-        options={"config_path": "/tmp/ov.conf", "max_iterations": 9},
+        options={
+            "config_path": "/tmp/ov.conf",
+            "max_iterations": 9,
+        },
         concurrency=2,
         rollout_language="zh",
     )
@@ -416,3 +421,4 @@ def test_tau2_service_rollout_backend_option_overrides_default(monkeypatch):
     assert isinstance(executor, FakeExecutor)
     assert calls[-1]["factory"]["backend"] == "vikingbot"
     assert calls[-1]["factory"]["options"]["max_iterations"] == 5
+    assert calls[-1]["factory"]["options"]["show_progress"] is True

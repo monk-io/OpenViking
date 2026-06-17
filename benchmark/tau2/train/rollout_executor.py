@@ -87,6 +87,8 @@ def make_tau2_rollout_executor(
         openviking_timeout=float(opts.get("openviking_timeout") or 600.0),
         scope_prompt=str(opts.get("scope_prompt") or ""),
         rollout_language=str(opts.get("rollout_language") or rollout_language),
+        show_progress=_bool_option(opts.get("show_progress"), default=False),
+        progress_label=str(opts.get("progress_label") or "tau2"),
     )
 
 

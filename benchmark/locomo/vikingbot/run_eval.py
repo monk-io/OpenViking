@@ -602,6 +602,7 @@ def main():
         if progress_tracker is not None:
             progress_tracker.job_started()
 
+        failed = False
         try:
             question = qa_item["question"]
             answer = qa_item["answer"]
@@ -697,9 +698,12 @@ def main():
                     print(f"Completed {processed_count}/{total_count}, time cost: {round(time_cost, 2)}s")
 
             return True
+        except Exception:
+            failed = True
+            raise
         finally:
             if progress_tracker is not None:
-                progress_tracker.job_finished()
+                progress_tracker.job_finished(failed=failed)
 
     # 使用线程池处理：全局并行，每个 question 独立 session
     ctx = progress if show_progress else _NullCtx()
