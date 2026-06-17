@@ -114,6 +114,38 @@ def test_default_single_turn_prompt_contains_case_policy_and_rubric():
     assert "verify_duplicate" in prompt
 
 
+def test_dataset_service_policy_set_from_dict_preserves_policies():
+    from openviking.session.train.components.dataset_service import policy_set_from_dict
+
+    policy_set = policy_set_from_dict(
+        {
+            "root_uri": "viking://user/u/memories/experiences",
+            "policies": [
+                {
+                    "name": "booking_policy",
+                    "uri": "viking://user/u/memories/experiences/booking_policy.md",
+                    "version": 2,
+                    "status": "production",
+                    "content": "Always verify duplicates before cancellation.",
+                    "metadata": {"domain": "booking"},
+                }
+            ],
+            "metadata": {"snapshot": "remote"},
+        }
+    )
+
+    assert policy_set.root_uri == "viking://user/u/memories/experiences"
+    assert policy_set.metadata == {"snapshot": "remote"}
+    assert len(policy_set.policies) == 1
+    policy = policy_set.policies[0]
+    assert policy.name == "booking_policy"
+    assert policy.uri == "viking://user/u/memories/experiences/booking_policy.md"
+    assert policy.version == 2
+    assert policy.status == "production"
+    assert policy.content == "Always verify duplicates before cancellation."
+    assert policy.metadata == {"domain": "booking"}
+
+
 def test_tau2_rollout_messages_use_structured_tool_parts():
     from benchmark.tau2.train.rollout_executor import _build_rollout_messages
     from openviking.message import TextPart, ToolPart

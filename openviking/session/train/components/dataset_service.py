@@ -19,6 +19,7 @@ from pydantic import BaseModel, Field
 from openviking.session.train.context import ExecutionContext
 from openviking.session.train.domain import (
     Case,
+    Experience,
     ExperienceSet,
     Rollout,
     Rubric,
@@ -298,7 +299,17 @@ def case_from_dict(data: dict[str, Any]) -> Case:
 def policy_set_from_dict(data: dict[str, Any]) -> ExperienceSet:
     return ExperienceSet(
         root_uri=data["root_uri"],
-        policies=[],
+        policies=[
+            Experience(
+                name=item["name"],
+                uri=item["uri"],
+                version=int(item["version"]),
+                status=item["status"],
+                content=item["content"],
+                metadata=dict(item.get("metadata") or {}),
+            )
+            for item in data.get("policies", [])
+        ],
         metadata=dict(data.get("metadata") or {}),
     )
 
