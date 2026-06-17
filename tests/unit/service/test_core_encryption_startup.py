@@ -48,7 +48,7 @@ async def test_build_ragfs_binding_config_works_inside_running_event_loop(monkey
         assert config["encryption"]["enabled"] is True
         return _FakeEncryptor()
 
-    monkeypatch.setattr("openviking.service.core.bootstrap_encryption", _bootstrap)
+    monkeypatch.setattr("openviking.crypto.config.bootstrap_encryption", _bootstrap)
     service = OpenVikingService.__new__(OpenVikingService)
     service._config = _FakeConfig()
     service._encryptor = None
@@ -61,7 +61,7 @@ async def test_build_ragfs_binding_config_works_inside_running_event_loop(monkey
         "encryption": {
             "root_key": b"k" * 32,
             "provider_type": 1,
-        }
+        },
     }
     assert isinstance(service._encryptor, _FakeEncryptor)
 
