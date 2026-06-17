@@ -3,6 +3,9 @@
 
 from __future__ import annotations
 
+import asyncio
+import time
+
 import pytest
 
 from openviking.session.train import (
@@ -425,3 +428,27 @@ def test_tau2_service_rollout_backend_option_overrides_default(monkeypatch):
 
     app["make_rollout_executor"]({"rollout_backend": "native", "show_progress": True})
     assert calls[-1]["factory"]["options"]["show_progress"] is True
+
+
+@pytest.mark.asyncio
+async def test_tau2_vikingbot_rollout_does_not_block_event_loop(monkeypatch):
+    from benchmark.tau2.train.rollout_executor_vikingbot import VikingBotTau2RolloutExecutor
+
+    class FakeVikingBotExecutor(VikingBotTau2RolloutExecutor):
+        async def _execute_one_async(self, case, context):
+            del context
+            time.sleep(0.2)
+            return case.name
+
+    executor = FakeVikingBotExecutor()
+    heartbeat = asyncio.create_task(asyncio.sleep(0.05))
+    rollout_task = asyncio.create_task(
+        executor._execute_one(
+            _case(),
+            ExecutionContext(policy_snapshot_id="snapshot", metadata={}),
+        )
+    )
+
+    await asyncio.wait_for(heartbeat, timeout=0.15)
+    assert not rollout_task.done()
+    assert await rollout_task == "case-1"
