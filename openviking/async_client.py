@@ -246,6 +246,22 @@ class AsyncOpenViking:
         await self._ensure_initialized()
         return await self._client.get_task(task_id)
 
+    async def list_tasks(
+        self,
+        task_type: Optional[str] = None,
+        status: Optional[str] = None,
+        resource_id: Optional[str] = None,
+        limit: int = 50,
+    ) -> list[dict[str, Any]]:
+        """List background tasks visible to the current caller."""
+        await self._ensure_initialized()
+        return await self._client.list_tasks(
+            task_type=task_type,
+            status=status,
+            resource_id=resource_id,
+            limit=limit,
+        )
+
     async def reindex(
         self,
         uri: str,
@@ -529,10 +545,16 @@ class AsyncOpenViking:
             show_all_hidden=show_all_hidden,
         )
 
-    async def rm(self, uri: str, recursive: bool = False) -> None:
+    async def rm(
+        self,
+        uri: str,
+        recursive: bool = False,
+        wait: bool = False,
+        timeout: Optional[float] = None,
+    ) -> None:
         """Remove resource"""
         await self._ensure_initialized()
-        await self._client.rm(uri, recursive=recursive)
+        await self._client.rm(uri, recursive=recursive, wait=wait, timeout=timeout)
 
     async def grep(
         self,

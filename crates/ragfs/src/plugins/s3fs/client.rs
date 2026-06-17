@@ -4,9 +4,9 @@
 //! Supports AWS S3 and S3-compatible services (MinIO, LocalStack, TOS).
 
 use crate::core::{ConfigValue, Error, Result};
-use aws_sdk_s3::error::SdkError;
 use aws_sdk_s3::config::{BehaviorVersion, Credentials, Region};
 use aws_sdk_s3::error::ProvideErrorMetadata;
+use aws_sdk_s3::error::SdkError;
 use aws_sdk_s3::operation::{RequestId, RequestIdExt};
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::Client;
@@ -255,6 +255,20 @@ fn aws_datetime_to_systemtime(dt: &aws_sdk_s3::primitives::DateTime) -> SystemTi
     }
 }
 
+/// The Content-Type to be written to S3 is inferred from the filename suffix of the object key.
+fn detect_content_type_for_key(key: &str) -> Option<String> {
+    if key.ends_with('/') {
+        return None;
+    }
+
+    Some(
+        mime_guess::from_path(key)
+            .first_or_octet_stream()
+            .essence_str()
+            .to_string(),
+    )
+}
+
 /// S3 Client wrapper
 pub struct S3Client {
     client: Client,
@@ -263,6 +277,7 @@ pub struct S3Client {
     normalize_encoding_chars: String,
     marker_mode: DirectoryMarkerMode,
     disable_batch_delete: bool,
+    auto_detect_content_type: bool,
 }
 
 impl S3Client {
@@ -347,6 +362,11 @@ impl S3Client {
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
 
+        let auto_detect_content_type = config
+            .get("auto_detect_content_type")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+
         // Build S3 config
         let mut s3_config_builder = aws_sdk_s3::Config::builder()
             .behavior_version(BehaviorVersion::latest())
@@ -374,6 +394,7 @@ impl S3Client {
             normalize_encoding_chars,
             marker_mode,
             disable_batch_delete,
+            auto_detect_content_type,
         })
     }
 
@@ -472,14 +493,26 @@ impl S3Client {
 
     /// Upload an object
     pub async fn put_object(&self, key: &str, data: Vec<u8>) -> Result<()> {
-        self.client
+        let mut request = self
+            .client
             .put_object()
             .bucket(&self.bucket)
             .key(key)
-            .body(ByteStream::from(data))
-            .send()
-            .await
-            .map_err(|e| format_sdk_s3_error("PutObject", &format!("bucket={} key={key}", self.bucket), &e))?;
+            .body(ByteStream::from(data));
+
+        if self.auto_detect_content_type {
+            if let Some(content_type) = detect_content_type_for_key(key) {
+                request = request.content_type(content_type);
+            }
+        }
+
+        request.send().await.map_err(|e| {
+            format_sdk_s3_error(
+                "PutObject",
+                &format!("bucket={} key={key}", self.bucket),
+                &e,
+            )
+        })?;
 
         Ok(())
     }
@@ -493,7 +526,11 @@ impl S3Client {
             .send()
             .await
             .map_err(|e| {
-                format_sdk_s3_error("DeleteObject", &format!("bucket={} key={key}", self.bucket), &e)
+                format_sdk_s3_error(
+                    "DeleteObject",
+                    &format!("bucket={} key={key}", self.bucket),
+                    &e,
+                )
             })?;
 
         Ok(())
@@ -621,16 +658,13 @@ impl S3Client {
                 req = req.continuation_token(token);
             }
 
-            let resp = req
-                .send()
-                .await
-                .map_err(|e| {
-                    format_sdk_s3_error(
-                        "ListObjectsV2",
-                        &format!("bucket={} prefix={prefix}", self.bucket),
-                        &e,
-                    )
-                })?;
+            let resp = req.send().await.map_err(|e| {
+                format_sdk_s3_error(
+                    "ListObjectsV2",
+                    &format!("bucket={} prefix={prefix}", self.bucket),
+                    &e,
+                )
+            })?;
 
             // Process files (contents)
             for obj in resp.contents() {
@@ -695,16 +729,13 @@ impl S3Client {
                 req = req.continuation_token(token);
             }
 
-            let resp = req
-                .send()
-                .await
-                .map_err(|e| {
-                    format_sdk_s3_error(
-                        "ListObjectsV2",
-                        &format!("bucket={} prefix={prefix}", self.bucket),
-                        &e,
-                    )
-                })?;
+            let resp = req.send().await.map_err(|e| {
+                format_sdk_s3_error(
+                    "ListObjectsV2",
+                    &format!("bucket={} prefix={prefix}", self.bucket),
+                    &e,
+                )
+            })?;
 
             for obj in resp.contents() {
                 let key = obj.key().unwrap_or("");
@@ -922,6 +953,7 @@ mod tests {
             normalize_encoding_chars: normalize_encoding_chars.to_string(),
             marker_mode: DirectoryMarkerMode::Empty,
             disable_batch_delete: false,
+            auto_detect_content_type: false,
         }
     }
 
@@ -991,13 +1023,34 @@ mod tests {
     }
 
     #[test]
-    fn test_format_generic_s3_error_includes_operation_bucket_key_and_raw_error() {
-        let err = format_generic_s3_error(
-            "PutObject",
-            "test-bucket",
-            "tenant/a.txt",
-            "service error",
+    fn test_detect_content_type_for_key_uses_filename_extension() {
+        assert_eq!(
+            detect_content_type_for_key("tenant/docs/readme.md").as_deref(),
+            Some("text/markdown")
         );
+        assert_eq!(
+            detect_content_type_for_key("tenant/docs/data.json").as_deref(),
+            Some("application/json")
+        );
+        assert_eq!(
+            detect_content_type_for_key("tenant/images/logo.png").as_deref(),
+            Some("image/png")
+        );
+    }
+
+    #[test]
+    fn test_detect_content_type_for_key_handles_unknown_and_directory_marker() {
+        assert_eq!(
+            detect_content_type_for_key("tenant/blob/no-extension").as_deref(),
+            Some("application/octet-stream")
+        );
+        assert_eq!(detect_content_type_for_key("tenant/dir/"), None);
+    }
+
+    #[test]
+    fn test_format_generic_s3_error_includes_operation_bucket_key_and_raw_error() {
+        let err =
+            format_generic_s3_error("PutObject", "test-bucket", "tenant/a.txt", "service error");
 
         match err {
             Error::Internal(message) => {

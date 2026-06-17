@@ -20,6 +20,17 @@ fn normalize_shape_path(path: &str) -> String {
     normalized
 }
 
+fn is_persistent_task_record_path(path: &str) -> bool {
+    let parts: Vec<&str> = path.trim_matches('/').split('/').collect();
+    if let ["_system", "tasks", user_id, _record, ..] = parts.as_slice() {
+        return !user_id.is_empty();
+    }
+    if let [account_id, "_system", "tasks", user_id, _record, ..] = parts.as_slice() {
+        return !account_id.is_empty() && !user_id.is_empty();
+    }
+    false
+}
+
 /// Read the raw guard-file bytes from the backend root.
 async fn read_shape_guard_raw(raw_fs: &Arc<dyn FileSystem>) -> Result<Option<Vec<u8>>> {
     match raw_fs.read(SHAPE_MANIFEST_PATH, 0, 0).await {
@@ -101,12 +112,15 @@ pub async fn detect_legacy_shape(raw_fs: &Arc<dyn FileSystem>) -> Result<Option<
     let mut detected: Option<StorageShape> = None;
 
     for entry in entries {
-        if entry.info.is_dir {
+        // Zero-byte files are a legacy plaintext artifact in the current implementation, but they
+        // do not carry enough signal to classify backend shape reliably. Skip them here instead of
+        // forcing a plaintext verdict during legacy shape inference.
+        if entry.info.is_dir || entry.info.size == 0 {
             continue;
         }
 
         let normalized = normalize_shape_path(&entry.path);
-        if normalized == SHAPE_MANIFEST_PATH {
+        if normalized == SHAPE_MANIFEST_PATH || is_persistent_task_record_path(&normalized) {
             continue;
         }
 
