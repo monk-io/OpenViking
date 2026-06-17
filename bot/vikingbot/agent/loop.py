@@ -712,7 +712,7 @@ class AgentLoop:
 
             if response.has_tool_calls:
                 # Inject experience memory before write-related tool calls (once per session)
-                if not write_exp_injected:
+                if ov_tools_enable and not write_exp_injected:
                     _ov_cfg = load_config().ov_server
                     _write_tools = set(_ov_cfg.exp_write_tools)
                     if any(tc.name in _write_tools for tc in response.tool_calls):
