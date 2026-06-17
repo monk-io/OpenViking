@@ -4,6 +4,7 @@ from rich.progress import ProgressColumn
 
 from benchmark.locomo.vikingbot.progress_utils import (
     AsyncProgressTracker,
+    ProgressSummaryColumn,
     ThreadSafeProgressTracker,
     ThreeStateBarColumn,
     make_three_state_progress,
@@ -25,6 +26,28 @@ def test_three_state_progress_renders_without_missing_cache_error():
     renderables = list(progress.get_renderables())
 
     assert renderables
+
+
+def test_progress_summary_hides_ok_and_zero_failed_counts():
+    progress, task_id = make_three_state_progress(description="Test", transient=True)
+    progress.update(task_id, total=25, completed=23, running=0, succeeded=23, failed=0)
+    task = progress.tasks[0]
+
+    summary = ProgressSummaryColumn().render(task).plain
+
+    assert summary == "(23/25)"
+    assert "ok" not in summary
+    assert "failed" not in summary
+
+
+def test_progress_summary_shows_failed_only_when_non_zero():
+    progress, task_id = make_three_state_progress(description="Test", transient=True)
+    progress.update(task_id, total=25, completed=24, running=0, succeeded=23, failed=1)
+    task = progress.tasks[0]
+
+    summary = ProgressSummaryColumn().render(task).plain
+
+    assert summary == "(24/25, 1 failed)"
 
 
 def test_locomo_progress_tracker_records_failed_jobs():

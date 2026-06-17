@@ -65,6 +65,25 @@ class ThreeStateBarColumn(ProgressColumn):
         return bar
 
 
+class ProgressSummaryColumn(ProgressColumn):
+    """Render processed count plus non-zero active/failure counts."""
+
+    def render(self, task: Task) -> Text:
+        failed = max(int(task.fields.get("failed", 0) or 0), 0)
+        running = max(int(task.fields.get("running", 0) or 0), 0)
+
+        summary = Text("(")
+        summary.append(f"{int(task.completed or 0)}/{int(task.total or 0)}")
+        if failed > 0:
+            summary.append(", ")
+            summary.append(f"{failed} failed", style="bold red")
+        if running > 0:
+            summary.append(", ")
+            summary.append(f"{running} running", style="bold yellow")
+        summary.append(")")
+        return summary
+
+
 @dataclass(slots=True)
 class ProgressPrinter:
     """Render a four-state progress indicator for train components.
@@ -194,13 +213,8 @@ class ProgressPrinter:
             return
         self._progress = Progress(
             ThreeStateBarColumn(),
-            TextColumn(
-                "[progress.percentage]{task.percentage:>3.0f}% "
-                "({task.completed}/{task.total}, "
-                "[bold green]{task.fields[succeeded]} ok[/], "
-                "[bold red]{task.fields[failed]} failed[/], "
-                "[bold yellow]{task.fields[running]} running[/])"
-            ),
+            TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
+            ProgressSummaryColumn(),
             console=Console(stderr=True, soft_wrap=False),
             transient=False,
         )
@@ -242,8 +256,8 @@ class ProgressPrinter:
         suffix = "\n" if newline else ""
         sys.stdout.write(
             f"\r[{self.label}] [{bar}] {percent:6.2f}% "
-            f"({processed}/{self.total}, {self.completed} ok, "
-            f"{self.failed} failed, {self.running} running){suffix}"
+            f"{_progress_summary(processed=processed, total=self.total, failed=self.failed, running=self.running)}"
+            f"{suffix}"
         )
         sys.stdout.flush()
 
@@ -282,6 +296,17 @@ def _state_widths(
         widths[idx] += 1
 
     return widths[0], widths[1], widths[2], widths[3]
+
+
+def _progress_summary(*, processed: int, total: int, failed: int, running: int) -> str:
+    extras: list[str] = []
+    if failed > 0:
+        extras.append(f"{failed} failed")
+    if running > 0:
+        extras.append(f"{running} running")
+    if extras:
+        return f"({processed}/{total}, {', '.join(extras)})"
+    return f"({processed}/{total})"
 
 
 def format_duration(seconds: float) -> str:
