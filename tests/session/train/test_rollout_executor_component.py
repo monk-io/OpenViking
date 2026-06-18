@@ -512,3 +512,70 @@ async def test_tau2_vikingbot_rollout_runs_on_current_event_loop():
     assert result == "case-1"
     assert observed["loop"] is expected_loop
     assert observed["thread"] == expected_thread
+
+
+@pytest.mark.asyncio
+async def test_tau2_vikingbot_blocking_setup_and_reward_are_offloaded(monkeypatch):
+    import benchmark.tau2.train.rollout_executor_vikingbot as module
+    from benchmark.tau2.train.rollout_executor_vikingbot import VikingBotTau2RolloutExecutor
+
+    event_loop_thread = threading.get_ident()
+    calls = []
+
+    class FakeEnv:
+        def _get_reward(self):
+            calls.append(("reward", threading.get_ident()))
+            return 1.0, {"ok": True}
+
+    class FakeTau2BenchToolProvider:
+        def __init__(self, domain, task_id, data_root=None):
+            self.domain = domain
+            self.task_id = task_id
+            self.data_root = data_root
+            self.env = FakeEnv()
+            self.policy = "policy"
+            self.user_query = "user query"
+
+        def reset(self):
+            calls.append(("reset", threading.get_ident()))
+
+        def list_openai_tools(self):
+            return []
+
+    class FakeAgent:
+        def __init__(self):
+            calls.append(("build_agent", threading.get_ident()))
+
+    async def fake_run_agent(**kwargs):
+        calls.append(("run_agent", threading.get_ident()))
+        return "final", None, [], {}, 1, None, None
+
+    monkeypatch.setattr(module, "_tool_provider_cls", lambda: FakeTau2BenchToolProvider)
+    monkeypatch.setattr(module, "_build_agent", lambda *args, **kwargs: FakeAgent())
+    monkeypatch.setattr(module, "_configure_tools", lambda *args, **kwargs: None)
+    monkeypatch.setattr(module, "_run_agent", fake_run_agent)
+
+    case = Case(
+        name="tau2_case",
+        task_signature="tau2:airline:train:0",
+        input={
+            "domain": "airline",
+            "task_id": "0",
+            "task_no": 0,
+            "data_split": "airline_train",
+        },
+        rubric=Rubric(name="rubric", description="", criteria=[]),
+    )
+    executor = VikingBotTau2RolloutExecutor()
+
+    rollout = await executor._execute_one(
+        case,
+        ExecutionContext(policy_snapshot_id="snapshot", metadata={}),
+    )
+
+    assert rollout.metadata["reward"] == 1.0
+    call_threads = dict(calls)
+    assert call_threads["reset"] != event_loop_thread
+    assert call_threads["build_agent"] != event_loop_thread
+    assert call_threads["reward"] != event_loop_thread
+    assert call_threads["run_agent"] == event_loop_thread

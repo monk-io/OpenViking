@@ -158,11 +158,15 @@ class VikingBotTau2RolloutExecutor:
         stage_started_at = time.perf_counter()
         Tau2BenchToolProvider = _tool_provider_cls()
         provider = Tau2BenchToolProvider(domain, task_id, data_root=data_root)
-        provider.reset()
+        await asyncio.to_thread(provider.reset)
         timings.record("provider_reset", stage_started_at)
 
         stage_started_at = time.perf_counter()
-        agent = _build_agent(self.config_path, max_iterations=self.max_iterations)
+        agent = await asyncio.to_thread(
+            _build_agent,
+            self.config_path,
+            max_iterations=self.max_iterations,
+        )
         timings.record("build_agent", stage_started_at)
 
         stage_started_at = time.perf_counter()
@@ -216,7 +220,7 @@ class VikingBotTau2RolloutExecutor:
             try:
                 # Customer-facing content should be sent before `done`; do not append
                 # the post-done final response to tau2's simulator/evaluator.
-                reward, evaluation_result = provider.env._get_reward()
+                reward, evaluation_result = await asyncio.to_thread(provider.env._get_reward)
                 reward = _to_jsonable(reward)
                 evaluation_result = _to_jsonable(evaluation_result)
             except Exception as exc:
