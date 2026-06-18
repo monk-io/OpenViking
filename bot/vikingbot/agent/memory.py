@@ -579,7 +579,7 @@ class MemoryStore:
                     return "", []
 
             content = await self._parse_viking_memory(
-                experiences, client, min_score=0.3, max_chars=ov_cfg.exp_recall_max_chars
+                experiences, client, min_score=0.0, max_chars=ov_cfg.exp_recall_max_chars
             )
 
             # 收集实际被注入（full/summary/uri 都算）的 URI
@@ -587,7 +587,7 @@ class MemoryStore:
             recalled_uris = [
                 self._get_uri(exp)
                 for exp in experiences
-                if self._get_score(exp) >= 0.3
+                if self._get_score(exp) >= 0.0
             ]
 
             return content, recalled_uris
