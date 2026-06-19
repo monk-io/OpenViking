@@ -114,7 +114,7 @@ Earlier plugin versions configured tuning fields under a `codex` block in `~/.op
       │                 │                │                   │
       │             ┌───▼────────────────▼───────────────────▼──┐
       └────────────►│        OpenViking REST API                │
-                    │ /api/v1/search/find                       │
+                    │ /api/v1/search/search                      │
                     │ /api/v1/sessions [+/{id}/{messages,commit}]│
                     │ /api/v1/content/read                      │
                     └─────────────────┬─────────────────────────┘
@@ -152,7 +152,7 @@ On `resume`, the script skips commit/sweep. If local state has no live `ovSessio
 
 ### Auto-recall (every UserPromptSubmit)
 
-`auto-recall.mjs` reads `prompt` from stdin, calls `/api/v1/search/find`, ranks results, reads full content for top-ranked leaves, and emits:
+`auto-recall.mjs` reads `prompt` and `session_id` from stdin, derives the long-lived OpenViking session id (`cx-<safe-session-id>` unless legacy state already has an `ovSessionId`), calls `/api/v1/search/search` with that `session_id`, ranks results, reads full content for top-ranked leaves, and emits:
 
 ```json
 { "hookSpecificOutput": { "hookEventName": "UserPromptSubmit", "additionalContext": "<openviking-context source=\"auto-recall\" format=\"digest\">\nOpenViking memory digest:\n- ...\n</openviking-context>" } }
@@ -204,7 +204,7 @@ Codex's hook output schema differs from Claude Code's. Notably:
 | Hook | Input field of interest | Output channel for context injection |
 |------|------------------------|--------------------------------------|
 | `SessionStart`   | `source` (`startup`/`resume`/`clear`), `session_id` | `hookSpecificOutput.additionalContext` |
-| `UserPromptSubmit` | `prompt`                                    | `hookSpecificOutput.additionalContext` |
+| `UserPromptSubmit` | `prompt`, `session_id`                     | `hookSpecificOutput.additionalContext` |
 | `Stop`           | `last_assistant_message`, `transcript_path`, `session_id` | `systemMessage` (only) |
 | `PreCompact`     | `trigger` (`manual`/`auto`), `transcript_path`, `session_id` | `systemMessage` (only) |
 
@@ -226,7 +226,7 @@ codex-memory-plugin/
 │   ├── debug-log.mjs            # Structured JSONL logger
 │   ├── recall-compressor-profile.mjs # Compressor profile detection/cache
 │   ├── session-state.mjs        # Per-codex-session OV session state
-│   ├── auto-recall.mjs          # UserPromptSubmit hook (REST /search/find)
+│   ├── auto-recall.mjs          # UserPromptSubmit hook (REST /search/search)
 │   ├── auto-capture.mjs         # Stop hook (REST /sessions/{id}/messages)
 │   ├── session-start-commit.mjs # SessionStart hook (active-window + idle TTL)
 │   └── pre-compact-capture.mjs  # PreCompact hook

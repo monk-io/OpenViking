@@ -146,11 +146,16 @@ State is updated:
 
 ## Injected context boundary
 
-`UserPromptSubmit` stdin `prompt` is the user's prompt only. Recalled
-memory is sent back through `hookSpecificOutput.additionalContext`, then
-Codex injects it into the model turn. Transcript capture may later see
-that injected context adjacent to the prompt, so plugin-generated recall
-and resume context are wrapped in a deterministic boundary:
+`UserPromptSubmit` stdin includes the user's `prompt` plus the Codex
+`session_id`. Recall derives the same OpenViking session id used by Stop
+capture (`cx-<safe-session-id>`, unless legacy state already has an
+`ovSessionId`) and calls `/api/v1/search/search` with that `session_id`,
+so OpenViking can use recent session messages and archive overview during
+query expansion. Recalled memory is sent back through
+`hookSpecificOutput.additionalContext`, then Codex injects it into the
+model turn. Transcript capture may later see that injected context
+adjacent to the prompt, so plugin-generated recall and resume context are
+wrapped in a deterministic boundary:
 
 ```text
 <openviking-context source="auto-recall" format="digest">
@@ -326,6 +331,16 @@ Configured `off` (`OPENVIKING_RECALL_COMPRESS=0`, model `off`, or thinking
   "permission_mode": "default" | "acceptEdits" | "plan" | "dontAsk" | "bypassPermissions",
   "transcript_path": "/path/to/rollout.jsonl" | null,
   "hook_event_name": "SessionStart"
+}
+
+// UserPromptSubmit input
+{
+  "session_id": "0193af...",
+  "prompt": "user prompt text",
+  "cwd": "/path/to/cwd",
+  "model": "gpt-5.5",
+  "permission_mode": "default",
+  "hook_event_name": "UserPromptSubmit"
 }
 
 // Stop input
