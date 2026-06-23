@@ -1,0 +1,10 @@
+{
+  "outcome": "needs_help",
+  "templateType": "both",
+  "deployVerified": false,
+  "endpoint": "http://127.0.0.1:19380/health",
+  "httpStatus": 200,
+  "question": "Please provide the workspace secret openviking-root-api-key in Monk so I can deploy and verify the production openviking/stack template.",
+  "blockingReason": "",
+  "summary": "Generated MANIFEST, monk/openviking-base.yaml, monk/openviking-example.yaml, and monk/openviking-stack.yaml. Analyzer diagnostics have no errors. Local demonstration openviking/stack-local deployed successfully; monk ps shows local/openviking/example alive=true and ready=true, and GET http://127.0.0.1:19380/health returned HTTP 200 with healthy=true and auth_mode=api_key. Production standalone openviking/stack is authored as an ingress-only secure stack and reads its root API key from secret(\"openviking-root-api-key\"); that secret is absent, so a Monk workspace secret request was opened and production deployment/verification is pending human input."
+}

@@ -1,0 +1,91 @@
+namespace: openviking
+
+secure:
+  inherits: openviking/base
+  defines: runnable
+  metadata:
+    name: OpenViking Secure Service
+    description: Production-oriented OpenViking runnable. It binds on all interfaces, enables api_key authentication, and reads the sensitive root API key from the Monk secret named openviking-root-api-key. Set that secret when inheriting or deploying this runnable.
+    tags: production, secure, ai, context-database
+  permitted-secrets:
+    openviking-root-api-key: true
+  variables:
+    server-host:
+      type: string
+      env: OPENVIKING_SERVER_HOST
+      value: 0.0.0.0
+      description: Binds OpenViking to all interfaces inside the container for production ingress.
+    root-api-key:
+      type: string
+      env: OPENVIKING_ROOT_API_KEY
+      value: <- secret("openviking-root-api-key")
+      description: Sensitive OpenViking root API key value read from Monk secrets. Do not set a literal value in inherited templates.
+    openviking-config-content:
+      type: string
+      env: OPENVIKING_CONF_CONTENT
+      value: |
+        {
+          "storage": {
+            "workspace": "/app/.openviking/openviking_workspace",
+            "vectordb": {
+              "name": "context",
+              "backend": "local",
+              "project": "default"
+            },
+            "agfs": {
+              "backend": "local",
+              "timeout": 10
+            }
+          },
+          "log": {
+            "level": "INFO",
+            "output": "stdout"
+          },
+          "server": {
+            "host": "0.0.0.0",
+            "port": 1933,
+            "workers": 1,
+            "auth_mode": "api_key",
+            "root_api_key": "${OPENVIKING_ROOT_API_KEY}",
+            "cors_origins": ["*"]
+          },
+          "embedding": {
+            "dense": {
+              "provider": "openai",
+              "model": "text-embedding-3-small",
+              "api_key": "not-used-for-health",
+              "api_base": "http://127.0.0.1:9/v1",
+              "dimension": 1536,
+              "input": "text"
+            }
+          },
+          "encryption": {
+            "enabled": true
+          },
+          "auto_generate_l0": false,
+          "auto_generate_l1": false
+        }
+      description: Production ov.conf JSON. It expands OPENVIKING_ROOT_API_KEY inside the container, so the sensitive root API key comes from Monk secrets rather than source. Replace the placeholder embedding provider with real model credentials when inheriting for production use.
+  services:
+    api:
+      container: openviking
+      port: <- $server-port
+      protocol: tcp
+      ingress-routes:
+        openviking:
+          path-prefix: /
+      description: Production OpenViking API endpoint intended for Monk ingress. Local Monk targets do not provide ingress.
+  checks:
+    readiness:
+      code: http-get-service("openviking/secure", "api", "/health") get-member("status") 200 equal?
+      period: 5
+      attempts: 30
+
+stack:
+  defines: group
+  metadata:
+    name: OpenViking Stack
+    description: Secure production-oriented standalone OpenViking stack. It exposes the authenticated API only through Monk ingress and keeps persistent state on a Monk volume.
+    tags: stack, production, secure, ai, context-database
+  members:
+    - openviking/secure

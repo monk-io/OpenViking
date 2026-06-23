@@ -1,0 +1,89 @@
+namespace: openviking
+
+example:
+  inherits: openviking/base
+  defines: runnable
+  metadata:
+    name: OpenViking Component Example
+    description: Local composition example for the OpenViking dependency component. It inherits the base component, enables api_key authentication with a generated local root key, and publishes the API on a non-privileged host port for verification.
+    tags: example, local, ai, context-database
+  variables:
+    server-host:
+      type: string
+      env: OPENVIKING_SERVER_HOST
+      value: 0.0.0.0
+      description: Binds OpenViking to all interfaces inside the container for the local published-port example.
+    health-port:
+      type: int
+      value: 19380
+      description: Host port published by the local example for OpenViking HTTP checks.
+    local-root-api-key:
+      type: string
+      env: OPENVIKING_ROOT_API_KEY
+      value: <- random-uuid
+      description: Sensitive generated root API key for this local example deployment. Production inheritors must use root-api-key from secret("openviking-root-api-key") instead of a generated value.
+    openviking-config-content:
+      type: string
+      env: OPENVIKING_CONF_CONTENT
+      value: |
+        {
+          "storage": {
+            "workspace": "/app/.openviking/openviking_workspace",
+            "vectordb": {
+              "name": "context",
+              "backend": "local",
+              "project": "default"
+            },
+            "agfs": {
+              "backend": "local",
+              "timeout": 10
+            }
+          },
+          "log": {
+            "level": "INFO",
+            "output": "stdout"
+          },
+          "server": {
+            "host": "0.0.0.0",
+            "port": 1933,
+            "workers": 1,
+            "auth_mode": "api_key",
+            "root_api_key": "${OPENVIKING_ROOT_API_KEY}",
+            "cors_origins": ["*"]
+          },
+          "embedding": {
+            "dense": {
+              "provider": "openai",
+              "model": "text-embedding-3-small",
+              "api_key": "not-used-for-health",
+              "api_base": "http://127.0.0.1:9/v1",
+              "dimension": 1536,
+              "input": "text"
+            }
+          },
+          "auto_generate_l0": false,
+          "auto_generate_l1": false
+        }
+      description: Local ov.conf JSON. It enables api_key authentication, expands a generated local root API key from the container environment, and uses a non-secret placeholder embedding provider for startup and health checks.
+  services:
+    api:
+      container: openviking
+      port: <- $server-port
+      protocol: tcp
+      publish: true
+      host-port: <- $health-port
+      description: Local published OpenViking API endpoint for external verification. Non-health API calls require the generated local root API key.
+  checks:
+    readiness:
+      code: http-get-service("openviking/example", "api", "/health") get-member("status") 200 equal?
+      period: 5
+      attempts: 30
+
+stack-local:
+  defines: group
+  metadata:
+    name: OpenViking Local Stack
+    description: Local verification flavor for the standalone OpenViking stack. It runs the same self-contained OpenViking service as the component example and publishes only probe endpoints on a non-privileged host port.
+    tags: stack, local, ai, context-database
+  members:
+    - openviking/example
