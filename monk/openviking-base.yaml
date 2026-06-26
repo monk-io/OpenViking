@@ -1,0 +1,96 @@
+namespace: openviking
+
+base:
+  defines: runnable
+  metadata:
+    name: OpenViking
+    description: Reusable OpenViking context database component using the public GHCR image and durable local filesystem state under /app/.openviking. It has no mandatory backing service; embeddings and model access are configured in ov.conf through external APIs or an inherited local model setup. For network-exposed production use, inherit this base and configure api_key authentication with a root API key read from a Monk secret.
+    tags: ai, agent-memory, context-database, filesystem, rag
+  containers:
+    openviking:
+      image: ghcr.io/volcengine/openviking
+      image-tag: <- $image-tag
+      restart: unless-stopped
+      logs:
+        quota: 100M
+        count: 5
+  variables:
+    image-tag:
+      type: string
+      value: latest
+      description: Public OpenViking image tag from ghcr.io/volcengine/openviking.
+    server-port:
+      type: int
+      value: 1933
+      description: Port where the OpenViking API listens inside the container.
+    server-host:
+      type: string
+      env: OPENVIKING_SERVER_HOST
+      value: 127.0.0.1
+      description: Host interface used by the OpenViking server process. The base uses localhost for dev auth safety; inherited network-facing templates should override this to 0.0.0.0 and enable api_key authentication.
+    config-file:
+      type: string
+      env: OPENVIKING_CONFIG_FILE
+      value: /app/.openviking/monk/ov-v2.conf
+      description: Path for the Monk-managed OpenViking configuration file inside the persistent volume.
+    with-bot:
+      type: string
+      env: OPENVIKING_WITH_BOT
+      value: "0"
+      description: Set to "1" to start vikingbot with the API server; the default keeps the component to the OpenViking API only.
+    openviking-config-content:
+      type: string
+      env: OPENVIKING_CONF_CONTENT
+      value: |
+        {
+          "storage": {
+            "workspace": "/app/.openviking/openviking_workspace",
+            "vectordb": {
+              "name": "context",
+              "backend": "local",
+              "project": "default"
+            },
+            "agfs": {
+              "backend": "local",
+              "timeout": 10
+            }
+          },
+          "log": {
+            "level": "INFO",
+            "output": "stdout"
+          },
+          "server": {
+            "host": "127.0.0.1",
+            "port": 1933,
+            "workers": 1,
+            "cors_origins": ["*"]
+          },
+          "embedding": {
+            "dense": {
+              "provider": "openai",
+              "model": "text-embedding-3-small",
+              "api_key": "not-used-for-health",
+              "api_base": "http://127.0.0.1:9/v1",
+              "dimension": 1536,
+              "input": "text"
+            }
+          },
+          "auto_generate_l0": false,
+          "auto_generate_l1": false
+        }
+      description: Full ov.conf JSON written on first start. The base binds to localhost and dev auth for safe composition. The embedding provider is a non-secret placeholder sufficient for startup and health checks; inheritors should replace it with a real provider configuration and read sensitive keys using secret(...).
+    volume-size:
+      type: int
+      value: 20
+      description: Persistent storage size in GB for OpenViking configuration and workspace data.
+  volumes:
+    openviking-data:
+      kind: local
+      size: <- $volume-size
+      path: /app/.openviking
+  services:
+    api:
+      container: openviking
+      port: <- $server-port
+      protocol: tcp
+      description: Internal OpenViking API endpoint. It is not published by the base component.

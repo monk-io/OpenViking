@@ -1,0 +1,5 @@
+LOAD monk/openviking-base.yaml
+LOAD monk/openviking-example.yaml
+LOAD monk/openviking-stack.yaml
+
+ENTRY openviking/stack-local
