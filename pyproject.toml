@@ -81,7 +81,7 @@ dependencies = [
     "cryptography>=48.0.1",
     "argon2-cffi>=23.0.0",
     "lark-oapi>=1.5.3",
-    "mcp>=1.27.0",
+    "mcp>=1.0.0",
     "pathspec>=1.1.1",
 ]
 
